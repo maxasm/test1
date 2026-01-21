@@ -1,16 +1,20 @@
 # Vanna AI 2.0 - Natural Language to SQL API
 
-Production-ready FastAPI application that converts natural language questions to SQL queries using OpenAI, with persistent learning via ChromaDB.
+Production-ready FastAPI application using the **official Vanna AI 2.0 agent framework** for natural language to SQL conversion with OpenAI LLM, MySQL database, and ChromaDB persistent memory.
+
+**Following official Vanna 2.0 docs:** https://vanna.ai/docs
 
 ## Features
 
-- **Natural Language to SQL**: Convert questions to MySQL queries using GPT-4
-- **Persistent Memory**: ChromaDB stores successful query patterns for learning
-- **Context Isolation**: User and conversation-based memory sandboxing
-- **Self-Learning**: System improves accuracy over time from successful queries
-- **Plotly Charts**: Automatic chart generation for visualizable data
+- **Official Vanna AI 2.0 Framework**: Uses `Agent`, `RunSqlTool`, `VisualizeDataTool`, and memory tools
+- **OpenAI LLM Integration**: `OpenAILlmService` for natural language understanding
+- **MySQL Database**: `MySQLRunner` for SQL query execution
+- **ChromaDB Agent Memory**: `ChromaAgentMemory` for persistent learning from successful queries
+- **User-Aware Permissions**: Custom `UserResolver` for PHP frontend integration
+- **Tool Memory**: Saves successful tool usage patterns for future reference
+- **Streaming Chat**: SSE-based streaming responses with rich UI components
+- **Built-in Web UI**: Pre-built `<vanna-chat>` component support
 - **Health Monitoring**: Component-level health checks
-- **PHP Compatible**: Simple JSON API for easy PHP integration
 
 ## Quick Start
 
@@ -54,85 +58,57 @@ This starts:
 curl http://localhost:8000/health
 ```
 
-### 4. Test Natural Language → SQL (and Memory)
+### 4. Test with Web UI
 
-Ask the same question twice. The second call should typically return `from_cache: true`.
+Open http://localhost:8000 in your browser to access the built-in Vanna web interface.
+
+### 5. Test via API (Streaming SSE)
 
 ```bash
-curl -s http://localhost:8000/api/chat \
+# Using curl with SSE streaming
+curl -N http://localhost:8000/api/vanna/v2/chat_sse \
   -H 'Content-Type: application/json' \
-  -d '{"question":"Top 5 products by revenue","user":"demo","conversation_id":"conv-1"}'
-
-curl -s http://localhost:8000/api/chat \
-  -H 'Content-Type: application/json' \
-  -d '{"question":"Top 5 products by revenue","user":"demo","conversation_id":"conv-1"}'
+  -H 'X-User-Id: demo@example.com' \
+  -H 'X-Conversation-Id: conv-1' \
+  -d '{"message":"Top 5 products by revenue"}'
 ```
 
 ## API Endpoints
 
-### POST /api/chat
+### POST /api/vanna/v2/chat_sse (Streaming)
 
-Convert natural language to SQL and execute.
+Main chat endpoint using Server-Sent Events for streaming responses.
+
+**Headers:**
+- `X-User-Id`: User identifier (or use `vanna_user` cookie)
+- `X-Conversation-Id`: Conversation ID (or use `vanna_conversation_id` cookie)
 
 **Request:**
 ```json
 {
-  "question": "Show me all users created this month",
-  "user": "user@example.com",
-  "conversation_id": "conv-123"
+  "message": "Show me all users created this month"
 }
 ```
 
-**Response:**
-```json
-{
-  "answer": "Found 15 results.",
-  "sql_query": "SELECT * FROM users WHERE created_at >= DATE_FORMAT(NOW(), '%Y-%m-01')",
-  "data": [{"id": 1, "name": "John", ...}],
-  "chart": {"data": [...], "layout": {...}},
-  "confidence": 0.9,
-  "from_cache": false
-}
-```
+**Response (SSE stream):**
+The response streams UI components including:
+- Text responses
+- SQL queries
+- Data tables (`DataFrameComponent`)
+- Charts (`ChartComponent`)
+- Tool execution status
 
 ### GET /health
 
 Check system health.
 
-**Response:**
-```json
-{
-  "status": "healthy",
-  "components": {
-    "chromadb": {"status": "healthy", "collection_count": 42},
-    "mysql": {"status": "healthy", "database": "vanna"},
-    "openai": {"status": "healthy", "model": "gpt-4"}
-  },
-  "timestamp": "2024-01-15T10:30:00"
-}
-```
+### GET /docs
 
-### GET /api/memory/{user}/{conversation_id}
+OpenAPI/Swagger documentation.
 
-Retrieve stored SQL patterns for a user/conversation.
+### GET /
 
-**Response:**
-```json
-{
-  "user": "user@example.com",
-  "conversation_id": "conv-123",
-  "memories": [
-    {
-      "id": "abc123",
-      "question": "Show all users",
-      "sql_query": "SELECT * FROM users",
-      "timestamp": "2024-01-15T10:00:00",
-      "confidence": 0.95
-    }
-  ],
-  "total_count": 1
-}
-```
+Built-in Vanna web UI.
 
 ## PHP Integration
 
@@ -145,29 +121,34 @@ class VannaClient {
         $this->baseUrl = $baseUrl;
     }
     
-    public function chat(string $question, string $user, string $conversationId): array {
-        $ch = curl_init($this->baseUrl . '/api/chat');
+    /**
+     * Send a chat message and receive streaming response.
+     * For PHP, you may want to use a non-streaming approach or process SSE.
+     */
+    public function chat(string $message, string $user, string $conversationId): Generator {
+        $ch = curl_init($this->baseUrl . '/api/vanna/v2/chat_sse');
         
         curl_setopt_array($ch, [
             CURLOPT_POST => true,
-            CURLOPT_RETURNTRANSFER => true,
-            CURLOPT_HTTPHEADER => ['Content-Type: application/json'],
-            CURLOPT_POSTFIELDS => json_encode([
-                'question' => $question,
-                'user' => $user,
-                'conversation_id' => $conversationId,
-            ]),
+            CURLOPT_RETURNTRANSFER => false,
+            CURLOPT_HTTPHEADER => [
+                'Content-Type: application/json',
+                'X-User-Id: ' . $user,
+                'X-Conversation-Id: ' . $conversationId,
+            ],
+            CURLOPT_POSTFIELDS => json_encode(['message' => $message]),
+            CURLOPT_WRITEFUNCTION => function($ch, $data) use (&$buffer) {
+                // Process SSE data
+                $buffer .= $data;
+                return strlen($data);
+            },
         ]);
         
-        $response = curl_exec($ch);
-        $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        curl_exec($ch);
         curl_close($ch);
         
-        if ($httpCode !== 200) {
-            throw new Exception("API error: $httpCode");
-        }
-        
-        return json_decode($response, true);
+        // Parse SSE events from buffer
+        return $this->parseSSE($buffer);
     }
     
     public function health(): array {
@@ -175,39 +156,74 @@ class VannaClient {
         return json_decode($response, true);
     }
     
-    public function getMemories(string $user, string $conversationId): array {
-        $url = $this->baseUrl . "/api/memory/$user/$conversationId";
-        $response = file_get_contents($url);
-        return json_decode($response, true);
+    private function parseSSE(string $buffer): array {
+        $events = [];
+        $lines = explode("\n", $buffer);
+        $currentData = '';
+        
+        foreach ($lines as $line) {
+            if (strpos($line, 'data: ') === 0) {
+                $currentData = substr($line, 6);
+                if ($currentData && $currentData !== '[DONE]') {
+                    $events[] = json_decode($currentData, true);
+                }
+            }
+        }
+        
+        return $events;
     }
 }
 
-// Usage
+// Usage with session-based user context
+session_start();
+
 $vanna = new VannaClient('http://localhost:8000');
 
 try {
-    $result = $vanna->chat(
+    $events = $vanna->chat(
         'Show me top 10 customers by revenue',
-        'admin@company.com',
+        $_SESSION['user_email'] ?? 'guest@example.com',
         'session-' . session_id()
     );
     
-    echo "SQL: " . $result['sql_query'] . "\n";
-    echo "Answer: " . $result['answer'] . "\n";
-    
-    if (!empty($result['data'])) {
-        foreach ($result['data'] as $row) {
-            print_r($row);
+    foreach ($events as $event) {
+        // Handle different component types
+        if (isset($event['type'])) {
+            switch ($event['type']) {
+                case 'text':
+                    echo $event['content'];
+                    break;
+                case 'dataframe':
+                    // Render table
+                    break;
+                case 'chart':
+                    // Pass to Plotly.js
+                    break;
+            }
         }
-    }
-    
-    if (!empty($result['chart'])) {
-        // Pass to Plotly.js on frontend
-        echo json_encode($result['chart']);
     }
 } catch (Exception $e) {
     echo "Error: " . $e->getMessage();
 }
+```
+
+## Web Component Integration
+
+Drop the Vanna chat component into any webpage:
+
+```html
+<!-- In your PHP/HTML template -->
+<script src="https://img.vanna.ai/vanna-components.js"></script>
+<vanna-chat 
+    sse-endpoint="http://localhost:8000/api/vanna/v2/chat_sse"
+    theme="light">
+</vanna-chat>
+
+<script>
+// Set user context via cookies (picked up by UserResolver)
+document.cookie = `vanna_user=${encodeURIComponent(userEmail)}; path=/`;
+document.cookie = `vanna_conversation_id=${encodeURIComponent(sessionId)}; path=/`;
+</script>
 ```
 
 ## Environment Variables
@@ -217,61 +233,86 @@ try {
 | `OPENAI_API_KEY` | Yes* | - | OpenAI API key |
 | `OPENAI_API_PROJECT_KEY` | Yes* | - | Alternative: OpenAI project key |
 | `OPENAI_MODEL` | No | gpt-4 | OpenAI model to use |
-| `OPENAI_EMBEDDING_MODEL` | No | text-embedding-3-small | OpenAI embedding model used for Chroma memory |
 | `MYSQL_DO_HOST` | Yes | - | MySQL host |
 | `MYSQL_DO_PORT` | No | 3306 | MySQL port |
 | `MYSQL_DO_USER` | Yes | - | MySQL username |
 | `MYSQL_DO_PASSWORD` | Yes | - | MySQL password |
 | `MYSQL_DO_DATABASE` | Yes | - | MySQL database name |
-| `CHROMA_HOST` | Yes | localhost | ChromaDB host |
+| `CHROMA_HOST` | No | localhost | ChromaDB host |
 | `CHROMA_PORT` | No | 8000 | ChromaDB port |
 | `CHROMA_COLLECTION_NAME` | No | vanna_memories | ChromaDB collection |
-| `APP_ENV` | No | production | Environment (development enables reload) |
+| `VANNA_HOST` | No | 0.0.0.0 | Server bind host |
+| `VANNA_PORT` | No | 8000 | Server port |
 | `LOG_LEVEL` | No | INFO | Logging level |
 
 *One of `OPENAI_API_KEY` or `OPENAI_API_PROJECT_KEY` is required.
 
-## Architecture
+## Architecture (Vanna AI 2.0)
 
 ```
-┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
-│   PHP Frontend  │────▶│   FastAPI App   │────▶│     MySQL       │
-└─────────────────┘     └────────┬────────┘     └─────────────────┘
-                                 │
-                                 │
-                        ┌────────▼────────┐
-                        │    ChromaDB     │
-                        │  (Vector Store) │
-                        └─────────────────┘
-                                 │
-                        ┌────────▼────────┐
-                        │     OpenAI      │
-                        │   (GPT-4 LLM)   │
-                        └─────────────────┘
+┌─────────────────┐     ┌─────────────────────────────────────────┐
+│   PHP Frontend  │────▶│          Vanna AI 2.0 Agent             │
+│  <vanna-chat>   │     │                                         │
+└─────────────────┘     │  ┌─────────────┐  ┌──────────────────┐  │
+                        │  │ UserResolver│  │   ToolRegistry   │  │
+                        │  └─────────────┘  │  ┌────────────┐  │  │
+                        │                   │  │ RunSqlTool │  │  │
+                        │  ┌─────────────┐  │  ├────────────┤  │  │
+                        │  │OpenAILlm    │  │  │VisualizeData│ │  │
+                        │  │Service      │  │  ├────────────┤  │  │
+                        │  └─────────────┘  │  │MemoryTools │  │  │
+                        │                   │  └────────────┘  │  │
+                        │  ┌─────────────┐  └──────────────────┘  │
+                        │  │ChromaAgent  │                        │
+                        │  │Memory       │                        │
+                        │  └─────────────┘                        │
+                        └───────────┬─────────────────────────────┘
+                                    │
+                    ┌───────────────┼───────────────┐
+                    ▼               ▼               ▼
+            ┌───────────┐   ┌───────────┐   ┌───────────┐
+            │  MySQL    │   │ ChromaDB  │   │  OpenAI   │
+            │ Database  │   │  Memory   │   │   API     │
+            └───────────┘   └───────────┘   └───────────┘
 ```
+
+## Vanna Tools
+
+The agent has access to these tools:
+
+| Tool | Description | Access Groups |
+|------|-------------|---------------|
+| `RunSqlTool` | Executes SQL queries against MySQL | admin, user |
+| `VisualizeDataTool` | Generates charts from query results | admin, user |
+| `SaveQuestionToolArgsTool` | Saves successful question→tool patterns | admin |
+| `SearchSavedCorrectToolUsesTool` | Searches past successful patterns | admin, user |
+| `SaveTextMemoryTool` | Saves arbitrary text memories | admin, user |
 
 ## Memory & Learning System
 
-1. **Question Received**: User asks natural language question
-2. **Semantic Search**: ChromaDB searches for similar past questions
-3. **Cache Hit**: If very similar question found (distance < 0.1), return cached SQL
-4. **SQL Generation**: OpenAI generates SQL with schema context + similar examples
-5. **Execution**: SQL runs against MySQL
-6. **Learning**: Successful queries saved to ChromaDB with embeddings
-7. **Improvement**: Future similar questions benefit from past successes
+Vanna 2.0 uses `ChromaAgentMemory` to store:
+1. **Successful tool usage patterns**: Question → Tool → Arguments → Result
+2. **Text memories**: Golden queries, business rules, notes
 
-### Context Isolation
+When a user asks a question:
+1. Agent searches memory for similar past questions
+2. Retrieves successful SQL patterns as context
+3. LLM generates new SQL informed by past successes
+4. On success, the pattern is saved for future reference
 
-Memories are filtered by `user` + `conversation_id` metadata:
-- Different users have separate memory sandboxes
-- Different conversations maintain separate context
-- Cross-conversation learning possible by querying user-level memories
+### User Context Isolation
+
+The `PHPFrontendUserResolver` extracts user identity from:
+- Headers: `X-User-Id`, `X-Conversation-Id`
+- Cookies: `vanna_user`, `vanna_conversation_id`
+
+Memory is scoped per user, ensuring isolation between different users.
 
 ## Development
 
 ```bash
-# Run in development mode (auto-reload)
-APP_ENV=development docker-compose up
+# Run in development mode
+docker-compose up
 
 # View logs
 docker-compose logs -f app

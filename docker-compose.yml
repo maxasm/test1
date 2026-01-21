@@ -20,7 +20,7 @@ services:
       retries: 20
 
   chroma:
-    image: chromadb/chroma:0.4.24
+    image: chromadb/chroma:1.1.0
     container_name: vanna-chroma
     restart: unless-stopped
     environment:
