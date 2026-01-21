@@ -1,0 +1,68 @@
+services:
+  mysql:
+    image: mysql:8.0
+    container_name: vanna-mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_DATABASE: ${MYSQL_DO_DATABASE:-vanna}
+      MYSQL_USER: ${MYSQL_DO_USER:-vanna}
+      MYSQL_PASSWORD: ${MYSQL_DO_PASSWORD:-vanna_password}
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-root_password}
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./mysql/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -p$${MYSQL_ROOT_PASSWORD:-root_password} --silent"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  chroma:
+    image: chromadb/chroma:0.4.24
+    container_name: vanna-chroma
+    restart: unless-stopped
+    environment:
+      IS_PERSISTENT: "true"
+      PERSIST_DIRECTORY: /chroma/chroma
+      ANONYMIZED_TELEMETRY: "False"
+    ports:
+      - "8001:8000"
+    volumes:
+      - chroma_data:/chroma/chroma
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: vanna-app
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      MYSQL_DO_HOST: mysql
+      MYSQL_DO_PORT: 3306
+      CHROMA_HOST: chroma
+      CHROMA_PORT: 8000
+      VANNA_HOST: 0.0.0.0
+      VANNA_PORT: 8000
+      APP_ENV: ${APP_ENV:-production}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    ports:
+      - "8000:8000"
+    depends_on:
+      mysql:
+        condition: service_healthy
+      chroma:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+
+volumes:
+  mysql_data:
+  chroma_data:
