@@ -41,8 +41,6 @@ services:
     env_file:
       - .env
     environment:
-      MYSQL_DO_HOST: mysql
-      MYSQL_DO_PORT: 3306
       CHROMA_HOST: chroma
       CHROMA_PORT: 8000
       VANNA_HOST: 0.0.0.0
@@ -51,9 +49,9 @@ services:
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
     ports:
       - "8000:8000"
+    volumes:
+      - ./ca-certificate-myfieuw.crt:/etc/ssl/do-mysql/ca-certificate-myfieuw.crt:ro
     depends_on:
-      mysql:
-        condition: service_healthy
       chroma:
         condition: service_started
     healthcheck:

@@ -61,6 +61,70 @@ from training_data import get_all_training_content
 
 
 # -----------------------------------------------------------------------------
+# Custom MySQL Runner with SSL Support
+# -----------------------------------------------------------------------------
+class SSLMySQLRunner(MySQLRunner):
+    """
+    MySQLRunner subclass that adds SSL support for secure database connections.
+    
+    DigitalOcean managed databases require SSL connections.
+    """
+    
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        user: str,
+        password: str,
+        database: str,
+        ssl_ca: str | None = None,
+    ):
+        # Store SSL config before calling parent
+        self._ssl_ca = ssl_ca
+        self._ssl_config = {"ca": ssl_ca} if ssl_ca else None
+        
+        # Store connection params for our custom connection method
+        self._host = host
+        self._port = port
+        self._user = user
+        self._password = password
+        self._database = database
+        
+        # Call parent init
+        super().__init__(
+            host=host,
+            port=port,
+            user=user,
+            password=password,
+            database=database,
+        )
+    
+    def _get_connection(self):
+        """Override to add SSL support to the connection."""
+        return pymysql.connect(
+            host=self._host,
+            port=self._port,
+            user=self._user,
+            password=self._password,
+            database=self._database,
+            ssl=self._ssl_config,
+            cursorclass=pymysql.cursors.DictCursor,
+            charset="utf8mb4",
+        )
+    
+    def run_sql(self, sql: str) -> list[dict]:
+        """Execute SQL with SSL connection."""
+        conn = self._get_connection()
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute(sql)
+                results = cursor.fetchall()
+                return list(results)
+        finally:
+            conn.close()
+
+
+# -----------------------------------------------------------------------------
 # Custom HTTP-based ChromaDB Agent Memory for Docker
 # -----------------------------------------------------------------------------
 class HttpChromaAgentMemory(ChromaAgentMemory):
@@ -226,16 +290,14 @@ def create_vanna_agent() -> Agent:
         ssl_enabled=bool(mysql_ssl_ca),
     )
     
-    # Build SSL config if certificate is provided
-    mysql_ssl_config = {"ca": mysql_ssl_ca} if mysql_ssl_ca else None
-    
-    sql_runner = MySQLRunner(
+    # Use custom SSL-enabled MySQL runner
+    sql_runner = SSLMySQLRunner(
         host=mysql_host,
         port=mysql_port,
         user=mysql_user,
         password=mysql_password,
         database=mysql_database,
-        ssl=mysql_ssl_config,
+        ssl_ca=mysql_ssl_ca,
     )
     
     # 3. Configure ChromaDB Agent Memory (persistent learning via HTTP)
