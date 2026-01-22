@@ -117,11 +117,24 @@ class SSLMySQLRunner(MySQLRunner):
             charset="utf8mb4",
         )
     
-    def run_sql(self, sql: str, *args, **kwargs) -> list[dict]:
+    def run_sql(self, sql, *args, **kwargs) -> list[dict]:
         """Execute SQL with SSL connection.
 
         Accepts *args/**kwargs for compatibility with the upstream Vanna tool interface.
         """
+        sql_text = sql
+        try:
+            if isinstance(sql_text, str):
+                pass
+            elif hasattr(sql_text, "sql"):
+                sql_text = getattr(sql_text, "sql")
+            elif isinstance(sql_text, dict) and "sql" in sql_text:
+                sql_text = sql_text.get("sql")
+            else:
+                sql_text = str(sql_text)
+        except Exception:
+            sql_text = str(sql)
+
         try:
             conn = self._get_connection()
         except Exception as e:
@@ -138,7 +151,7 @@ class SSLMySQLRunner(MySQLRunner):
 
         try:
             with conn.cursor() as cursor:
-                cursor.execute(sql)
+                cursor.execute(sql_text)
                 results = cursor.fetchall()
                 return list(results)
         except Exception as e:
@@ -149,7 +162,7 @@ class SSLMySQLRunner(MySQLRunner):
                 database=self._database,
                 user=self._user,
                 ssl_ca=self._ssl_ca,
-                sql=sql,
+                sql=sql_text,
                 error=str(e),
             )
             raise
