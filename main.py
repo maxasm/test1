@@ -1057,6 +1057,39 @@ def add_chat_sse_endpoint(app):
                 final_text = ai_response or ""
                 if sql_error:
                     final_text = (final_text + f"\n\n**SQL Execution Error:** {sql_error}").strip()
+                else:
+                    row_count = len(data or [])
+                    if sql_query and row_count == 0:
+                        final_text = "No results were found for your question."
+                    elif sql_query and row_count > 0:
+                        max_rows = 25
+                        preview_rows = (data or [])[:max_rows]
+                        summary_prompt = (
+                            "You are a helpful data analyst. Answer the user's question using ONLY the SQL results provided. "
+                            "Do not include SQL in your answer. If the results don't contain enough information, say so. "
+                            "Be concise.\n\n"
+                            f"User question: {message}\n"
+                            f"Row count: {row_count}\n"
+                            f"Rows (up to {max_rows}): {json.dumps(preview_rows, ensure_ascii=False)}\n"
+                        )
+
+                        try:
+                            summary = client.chat.completions.create(
+                                model=openai_model,
+                                messages=[
+                                    {"role": "system", "content": "Answer using the provided rows."},
+                                    {"role": "user", "content": summary_prompt},
+                                ],
+                                temperature=0.1,
+                            )
+                            summarized_text = summary.choices[0].message.content
+                            if summarized_text and summarized_text.strip():
+                                final_text = summarized_text.strip()
+                            else:
+                                final_text = f"Query returned {row_count} rows."
+                        except Exception as e:
+                            logger.error("chat_sse_result_summarize_failed", error=str(e))
+                            final_text = f"Query returned {row_count} rows."
 
                 yield _sse_event(
                     {
