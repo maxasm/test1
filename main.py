@@ -622,8 +622,39 @@ Be concise and helpful."""
                         data, sql_error = execute_sql(sql_query)
                         if sql_error:
                             ai_response += f"\n\n**SQL Execution Error:** {sql_error}"
-                        elif data:
-                            ai_response += f"\n\n**Query returned {len(data)} rows.**"
+                        else:
+                            row_count = len(data or [])
+                            if row_count == 0:
+                                ai_response = "No results were found for your question."
+                            else:
+                                # Summarize the results in natural language so the user doesn't need to run SQL.
+                                # Keep the SQL in the dedicated response field.
+                                max_rows = 25
+                                preview_rows = (data or [])[:max_rows]
+                                summary_prompt = (
+                                    "You are a helpful data analyst. Answer the user's question using ONLY the SQL results provided. "
+                                    "Do not include SQL in your answer. If the results don't contain enough information, say so. "
+                                    "Be concise.\n\n"
+                                    f"User question: {chat_request.message}\n"
+                                    f"Row count: {row_count}\n"
+                                    f"Rows (up to {max_rows}): {json.dumps(preview_rows, ensure_ascii=False)}\n"
+                                )
+
+                                try:
+                                    summary = client.chat.completions.create(
+                                        model=openai_model,
+                                        messages=[
+                                            {"role": "system", "content": "Answer using the provided rows."},
+                                            {"role": "user", "content": summary_prompt},
+                                        ],
+                                        temperature=0.1,
+                                    )
+                                    summarized_text = summary.choices[0].message.content
+                                    if summarized_text and summarized_text.strip():
+                                        ai_response = summarized_text.strip()
+                                except Exception as e:
+                                    logger.error("chat_result_summarize_failed", error=str(e))
+                                    ai_response = f"Query returned {row_count} rows."
             
             return ChatResponse(
                 response=ai_response,
