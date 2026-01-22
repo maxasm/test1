@@ -56,6 +56,7 @@ from vanna.integrations.chromadb import ChromaAgentMemory
 import chromadb
 from chromadb.config import Settings
 import pymysql
+import asyncio
 
 from training_data import get_all_training_content
 
@@ -117,32 +118,21 @@ class SSLMySQLRunner(MySQLRunner):
             charset="utf8mb4",
         )
     
-    def run_sql(self, sql, *args, **kwargs) -> list[dict]:
-        """Execute SQL with SSL connection.
-
-        Accepts *args/**kwargs for compatibility with the upstream Vanna tool interface.
-        """
+    def _normalize_sql(self, sql) -> str:
         sql_text = sql
         try:
             if isinstance(sql_text, str):
-                pass
-            elif hasattr(sql_text, "sql"):
-                sql_text = getattr(sql_text, "sql")
-            elif isinstance(sql_text, dict) and "sql" in sql_text:
-                sql_text = sql_text.get("sql")
-            else:
-                sql_text = str(sql_text)
+                return sql_text
+            if hasattr(sql_text, "sql"):
+                return getattr(sql_text, "sql")
+            if isinstance(sql_text, dict) and "sql" in sql_text:
+                return str(sql_text.get("sql"))
+            return str(sql_text)
         except Exception:
-            sql_text = str(sql)
+            return str(sql)
 
-        logger.info(
-            "mysql_run_sql_called",
-            sql_type=type(sql).__name__,
-            args_len=len(args),
-            kwargs_keys=sorted(list(kwargs.keys())),
-            sql_preview=(sql_text[:200] if isinstance(sql_text, str) else str(sql_text)[:200]),
-        )
-
+    def _run_sql_sync(self, sql_text: str) -> list[dict]:
+        """Blocking SQL execution. Use only from a worker thread."""
         try:
             conn = self._get_connection()
         except Exception as e:
@@ -179,6 +169,24 @@ class SSLMySQLRunner(MySQLRunner):
                 conn.close()
             except Exception:
                 pass
+
+    async def run_sql(self, sql, *args, **kwargs) -> list[dict]:
+        """Execute SQL with SSL connection (awaitable).
+
+        Vanna's tool layer may `await` this call. We run the blocking PyMySQL
+        work in a thread via asyncio.to_thread().
+        """
+        sql_text = self._normalize_sql(sql)
+
+        logger.info(
+            "mysql_run_sql_called",
+            sql_type=type(sql).__name__,
+            args_len=len(args),
+            kwargs_keys=sorted(list(kwargs.keys())),
+            sql_preview=(sql_text[:200] if isinstance(sql_text, str) else str(sql_text)[:200]),
+        )
+
+        return await asyncio.to_thread(self._run_sql_sync, sql_text)
 
 
 # -----------------------------------------------------------------------------
