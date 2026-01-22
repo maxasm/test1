@@ -16,6 +16,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY main.py ./main.py
 COPY training_data.py ./training_data.py
+COPY dashboard.py ./dashboard.py
 
 EXPOSE 8000
 

@@ -1,338 +1,248 @@
-# Vanna AI 2.0 - Natural Language to SQL API
+# Vanna AI 2.0 - Natural Language to SQL
 
-Production-ready FastAPI application using the **official Vanna AI 2.0 agent framework** for natural language to SQL conversion with OpenAI LLM, MySQL database, and ChromaDB persistent memory.
+Production-ready natural language to SQL application using Vanna AI 2.0 agent framework with OpenAI LLM, MySQL database, ChromaDB persistent memory, and a web dashboard.
 
-**Following official Vanna 2.0 docs:** https://vanna.ai/docs
+## Overview
 
-## Features
+This application allows users to query a MySQL database using natural language. It includes:
 
-- **Official Vanna AI 2.0 Framework**: Uses `Agent`, `RunSqlTool`, `VisualizeDataTool`, and memory tools
-- **OpenAI LLM Integration**: `OpenAILlmService` for natural language understanding
-- **MySQL Database**: `MySQLRunner` for SQL query execution
-- **ChromaDB Agent Memory**: `ChromaAgentMemory` for persistent learning from successful queries
-- **User-Aware Permissions**: Custom `UserResolver` for PHP frontend integration
-- **Tool Memory**: Saves successful tool usage patterns for future reference
-- **Streaming Chat**: SSE-based streaming responses with rich UI components
-- **Built-in Web UI**: Pre-built `<vanna-chat>` component support
-- **Health Monitoring**: Component-level health checks
+- **Vanna AI 2.0**: Agent framework for natural language to SQL
+- **OpenAI GPT-4**: Large language model for understanding queries
+- **MySQL**: Database for storing and querying data
+- **ChromaDB**: Vector database for persistent memory and learning
+- **Web Dashboard**: Protected admin interface with passkey authentication
+
+## Architecture
+
+```
+┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
+│   PHP Frontend  │────▶│  FastAPI Server │────▶│     MySQL       │
+│   (External)    │     │   (Vanna 2.0)   │     │   Database      │
+└─────────────────┘     └────────┬────────┘     └─────────────────┘
+                                 │
+                        ┌────────┴────────┐
+                        ▼                 ▼
+               ┌─────────────────┐ ┌─────────────────┐
+               │    ChromaDB     │ │    Dashboard    │
+               │ (Agent Memory)  │ │   (Port 8080)   │
+               └─────────────────┘ └─────────────────┘
+```
+
+## Services & Ports
+
+| Service | Port | Description |
+|---------|------|-------------|
+| MySQL | 3306 | Database server |
+| ChromaDB | 8001 | Vector memory store |
+| Vanna App | 8000 | Main FastAPI application |
+| Dashboard | 8080 | Web admin interface |
 
 ## Quick Start
 
+### Prerequisites
+
+- Docker and Docker Compose
+- OpenAI API key
+
 ### 1. Configure Environment
 
-Copy and edit the `.env` file:
+Edit the `.env` file with your settings:
 
-```bash
-# Required: Set your OpenAI API key
-OPENAI_API_KEY=sk-your-key-here
-# or
-OPENAI_API_PROJECT_KEY=sk-proj-your-key-here
+```env
+# Required: OpenAI API Key
+OPENAI_API_KEY=your-openai-api-key-here
+# Or use project key:
+OPENAI_API_PROJECT_KEY=sk-proj-...
 
-# Optional: Change model (default: gpt-4)
-OPENAI_MODEL=gpt-4
+# Dashboard passkey (change this!)
+DASHBOARD_PASSKEY=your-secure-passkey
 ```
 
-### 2. Start Services
+### 2. Start All Services
 
 ```bash
-docker-compose up -d
+docker-compose up -d --build
 ```
 
-This repo includes a mock MySQL schema + seed data at `mysql/init/001_mock_schema_and_seed.sql`.
+This starts all services:
+- MySQL database on port **3306**
+- ChromaDB on port **8001**
+- Vanna FastAPI server on port **8000**
+- Dashboard on port **8080**
 
-Note: MySQL init scripts only run the first time the database volume is created. To reseed/reset the mock data:
+### 3. Access the Dashboard
 
-```bash
-docker-compose down -v
-docker-compose up -d
+Open your browser and navigate to:
+
+```
+http://localhost:8080
 ```
 
-This starts:
-- **MySQL** on port 3306
-- **ChromaDB** on port 8001
-- **Vanna API** on port 8000
+Enter the passkey you configured in `.env` (`DASHBOARD_PASSKEY`) to access the dashboard.
 
-### 3. Verify Health
+### 4. Verify Services
+
+Check the health of the main application:
 
 ```bash
 curl http://localhost:8000/health
 ```
 
-### 4. Test with Web UI
+### 5. Seed Training Data (Optional)
 
-Open http://localhost:8000 in your browser to access the built-in Vanna web interface.
-
-### 5. Test via API (Streaming SSE)
+To improve query accuracy, seed the agent with schema documentation:
 
 ```bash
-# Using curl with SSE streaming
-curl -N http://localhost:8000/api/vanna/v2/chat_sse \
-  -H 'Content-Type: application/json' \
-  -H 'X-User-Id: demo@example.com' \
-  -H 'X-Conversation-Id: conv-1' \
-  -d '{"message":"Top 5 products by revenue"}'
+curl -X POST http://localhost:8000/api/train/seed
+```
+
+## Dashboard
+
+The web dashboard provides:
+
+- **Service Status**: View status of all running services
+- **Quick Actions**: Links to Vanna Chat, API docs, and health checks
+- **System Info**: Current configuration and environment details
+
+### Dashboard Authentication
+
+The dashboard is protected by a passkey. Configure it in `.env`:
+
+```env
+DASHBOARD_PASSKEY=your-secure-passkey
+DASHBOARD_PORT=8080
 ```
 
 ## API Endpoints
 
-### POST /api/vanna/v2/chat_sse (Streaming)
-
-Main chat endpoint using Server-Sent Events for streaming responses.
-
-**Headers:**
-- `X-User-Id`: User identifier (or use `vanna_user` cookie)
-- `X-Conversation-Id`: Conversation ID (or use `vanna_conversation_id` cookie)
-
-**Request:**
-```json
-{
-  "message": "Show me all users created this month"
-}
-```
-
-**Response (SSE stream):**
-The response streams UI components including:
-- Text responses
-- SQL queries
-- Data tables (`DataFrameComponent`)
-- Charts (`ChartComponent`)
-- Tool execution status
-
-### GET /health
-
-Check system health.
-
-### GET /docs
-
-OpenAPI/Swagger documentation.
-
-### GET /
-
-Built-in Vanna web UI.
-
-## PHP Integration
-
-```php
-<?php
-class VannaClient {
-    private string $baseUrl;
-    
-    public function __construct(string $baseUrl = 'http://localhost:8000') {
-        $this->baseUrl = $baseUrl;
-    }
-    
-    /**
-     * Send a chat message and receive streaming response.
-     * For PHP, you may want to use a non-streaming approach or process SSE.
-     */
-    public function chat(string $message, string $user, string $conversationId): Generator {
-        $ch = curl_init($this->baseUrl . '/api/vanna/v2/chat_sse');
-        
-        curl_setopt_array($ch, [
-            CURLOPT_POST => true,
-            CURLOPT_RETURNTRANSFER => false,
-            CURLOPT_HTTPHEADER => [
-                'Content-Type: application/json',
-                'X-User-Id: ' . $user,
-                'X-Conversation-Id: ' . $conversationId,
-            ],
-            CURLOPT_POSTFIELDS => json_encode(['message' => $message]),
-            CURLOPT_WRITEFUNCTION => function($ch, $data) use (&$buffer) {
-                // Process SSE data
-                $buffer .= $data;
-                return strlen($data);
-            },
-        ]);
-        
-        curl_exec($ch);
-        curl_close($ch);
-        
-        // Parse SSE events from buffer
-        return $this->parseSSE($buffer);
-    }
-    
-    public function health(): array {
-        $response = file_get_contents($this->baseUrl . '/health');
-        return json_decode($response, true);
-    }
-    
-    private function parseSSE(string $buffer): array {
-        $events = [];
-        $lines = explode("\n", $buffer);
-        $currentData = '';
-        
-        foreach ($lines as $line) {
-            if (strpos($line, 'data: ') === 0) {
-                $currentData = substr($line, 6);
-                if ($currentData && $currentData !== '[DONE]') {
-                    $events[] = json_decode($currentData, true);
-                }
-            }
-        }
-        
-        return $events;
-    }
-}
-
-// Usage with session-based user context
-session_start();
-
-$vanna = new VannaClient('http://localhost:8000');
-
-try {
-    $events = $vanna->chat(
-        'Show me top 10 customers by revenue',
-        $_SESSION['user_email'] ?? 'guest@example.com',
-        'session-' . session_id()
-    );
-    
-    foreach ($events as $event) {
-        // Handle different component types
-        if (isset($event['type'])) {
-            switch ($event['type']) {
-                case 'text':
-                    echo $event['content'];
-                    break;
-                case 'dataframe':
-                    // Render table
-                    break;
-                case 'chart':
-                    // Pass to Plotly.js
-                    break;
-            }
-        }
-    }
-} catch (Exception $e) {
-    echo "Error: " . $e->getMessage();
-}
-```
-
-## Web Component Integration
-
-Drop the Vanna chat component into any webpage:
-
-```html
-<!-- In your PHP/HTML template -->
-<script src="https://img.vanna.ai/vanna-components.js"></script>
-<vanna-chat 
-    sse-endpoint="http://localhost:8000/api/vanna/v2/chat_sse"
-    theme="light">
-</vanna-chat>
-
-<script>
-// Set user context via cookies (picked up by UserResolver)
-document.cookie = `vanna_user=${encodeURIComponent(userEmail)}; path=/`;
-document.cookie = `vanna_conversation_id=${encodeURIComponent(sessionId)}; path=/`;
-</script>
-```
-
-## Environment Variables
-
-| Variable | Required | Default | Description |
-|----------|----------|---------|-------------|
-| `OPENAI_API_KEY` | Yes* | - | OpenAI API key |
-| `OPENAI_API_PROJECT_KEY` | Yes* | - | Alternative: OpenAI project key |
-| `OPENAI_MODEL` | No | gpt-4 | OpenAI model to use |
-| `MYSQL_DO_HOST` | Yes | - | MySQL host |
-| `MYSQL_DO_PORT` | No | 3306 | MySQL port |
-| `MYSQL_DO_USER` | Yes | - | MySQL username |
-| `MYSQL_DO_PASSWORD` | Yes | - | MySQL password |
-| `MYSQL_DO_DATABASE` | Yes | - | MySQL database name |
-| `CHROMA_HOST` | No | localhost | ChromaDB host |
-| `CHROMA_PORT` | No | 8000 | ChromaDB port |
-| `CHROMA_COLLECTION_NAME` | No | vanna_memories | ChromaDB collection |
-| `VANNA_HOST` | No | 0.0.0.0 | Server bind host |
-| `VANNA_PORT` | No | 8000 | Server port |
-| `LOG_LEVEL` | No | INFO | Logging level |
-
-*One of `OPENAI_API_KEY` or `OPENAI_API_PROJECT_KEY` is required.
-
-## Architecture (Vanna AI 2.0)
-
-```
-┌─────────────────┐     ┌─────────────────────────────────────────┐
-│   PHP Frontend  │────▶│          Vanna AI 2.0 Agent             │
-│  <vanna-chat>   │     │                                         │
-└─────────────────┘     │  ┌─────────────┐  ┌──────────────────┐  │
-                        │  │ UserResolver│  │   ToolRegistry   │  │
-                        │  └─────────────┘  │  ┌────────────┐  │  │
-                        │                   │  │ RunSqlTool │  │  │
-                        │  ┌─────────────┐  │  ├────────────┤  │  │
-                        │  │OpenAILlm    │  │  │VisualizeData│ │  │
-                        │  │Service      │  │  ├────────────┤  │  │
-                        │  └─────────────┘  │  │MemoryTools │  │  │
-                        │                   │  └────────────┘  │  │
-                        │  ┌─────────────┐  └──────────────────┘  │
-                        │  │ChromaAgent  │                        │
-                        │  │Memory       │                        │
-                        │  └─────────────┘                        │
-                        └───────────┬─────────────────────────────┘
-                                    │
-                    ┌───────────────┼───────────────┐
-                    ▼               ▼               ▼
-            ┌───────────┐   ┌───────────┐   ┌───────────┐
-            │  MySQL    │   │ ChromaDB  │   │  OpenAI   │
-            │ Database  │   │  Memory   │   │   API     │
-            └───────────┘   └───────────┘   └───────────┘
-```
-
-## Vanna Tools
-
-The agent has access to these tools:
-
-| Tool | Description | Access Groups |
-|------|-------------|---------------|
-| `RunSqlTool` | Executes SQL queries against MySQL | admin, user |
-| `VisualizeDataTool` | Generates charts from query results | admin, user |
-| `SaveQuestionToolArgsTool` | Saves successful question→tool patterns | admin |
-| `SearchSavedCorrectToolUsesTool` | Searches past successful patterns | admin, user |
-| `SaveTextMemoryTool` | Saves arbitrary text memories | admin, user |
-
-## Memory & Learning System
-
-Vanna 2.0 uses `ChromaAgentMemory` to store:
-1. **Successful tool usage patterns**: Question → Tool → Arguments → Result
-2. **Text memories**: Golden queries, business rules, notes
-
-When a user asks a question:
-1. Agent searches memory for similar past questions
-2. Retrieves successful SQL patterns as context
-3. LLM generates new SQL informed by past successes
-4. On success, the pattern is saved for future reference
-
-### User Context Isolation
-
-The `PHPFrontendUserResolver` extracts user identity from:
-- Headers: `X-User-Id`, `X-Conversation-Id`
-- Cookies: `vanna_user`, `vanna_conversation_id`
-
-Memory is scoped per user, ensuring isolation between different users.
-
-## Development
+### Chat (Streaming)
 
 ```bash
-# Run in development mode
-docker-compose up
+POST /api/vanna/v2/chat_sse
+Content-Type: application/json
+
+{
+  "message": "Show me all customers from California"
+}
+```
+
+Headers for user identification:
+- `X-User-Id`: User identifier
+- `X-Conversation-Id`: Conversation identifier
+
+### Health Check
+
+```bash
+GET /health
+```
+
+### Training
+
+```bash
+GET /api/train/status      # Get training status
+POST /api/train/seed       # Seed training data
+```
+
+### Conversation History
+
+```bash
+GET /api/conversation/messages?limit=50
+GET /api/conversation/events?limit=200
+DELETE /api/conversation
+```
+
+## Configuration
+
+### Environment Variables
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `OPENAI_API_KEY` | OpenAI API key | Required |
+| `OPENAI_MODEL` | OpenAI model | `gpt-4` |
+| `OPENAI_EMBEDDING_MODEL` | Embedding model | `text-embedding-3-small` |
+| `MYSQL_DO_HOST` | MySQL host | `mysql` |
+| `MYSQL_DO_PORT` | MySQL port | `3306` |
+| `MYSQL_DO_DATABASE` | MySQL database | `vanna` |
+| `MYSQL_DO_USER` | MySQL user | `vanna` |
+| `MYSQL_DO_PASSWORD` | MySQL password | `vanna_password` |
+| `CHROMA_HOST` | ChromaDB host | `chroma` |
+| `CHROMA_PORT` | ChromaDB port | `8000` |
+| `VANNA_HOST` | Server bind host | `0.0.0.0` |
+| `VANNA_PORT` | Server port | `8000` |
+| `DASHBOARD_PASSKEY` | Dashboard access passkey | `changeme` |
+| `DASHBOARD_PORT` | Dashboard port | `8080` |
+| `APP_ENV` | Environment | `production` |
+| `LOG_LEVEL` | Logging level | `INFO` |
+
+## Docker Commands
+
+```bash
+# Start all services
+docker-compose up -d --build
 
 # View logs
-docker-compose logs -f app
+docker-compose logs -f
 
-# Rebuild after code changes
-docker-compose up --build
+# View specific service logs
+docker-compose logs -f dashboard
+docker-compose logs -f app
 
 # Stop all services
 docker-compose down
 
 # Stop and remove volumes (reset data)
 docker-compose down -v
+
+# Rebuild a specific service
+docker-compose up -d --build dashboard
 ```
 
-## API Documentation
+## Troubleshooting
 
-Interactive API docs available at:
-- Swagger UI: http://localhost:8000/docs
-- ReDoc: http://localhost:8000/redoc
+### Dashboard Not Loading
 
-## License
+1. Check if the container is running:
+   ```bash
+   docker-compose ps
+   ```
 
-MIT
+2. View dashboard logs:
+   ```bash
+   docker-compose logs dashboard
+   ```
+
+### MySQL Connection Issues
+
+Ensure MySQL is healthy:
+```bash
+docker-compose logs mysql
+```
+
+### ChromaDB Connection Issues
+
+Check ChromaDB is running:
+```bash
+curl http://localhost:8001/api/v1/heartbeat
+```
+
+### OpenAI API Errors
+
+Verify your API key is set in `.env`:
+```bash
+grep OPENAI .env
+```
+
+## File Structure
+
+```
+.
+├── .env                 # Environment configuration
+├── docker-compose.yml   # Docker services definition
+├── Dockerfile           # Container build instructions
+├── main.py              # Vanna FastAPI application
+├── dashboard.py         # Web dashboard application
+├── training_data.py     # Schema and training content
+├── requirements.txt     # Python dependencies
+└── mysql/
+    └── init/            # MySQL initialization scripts
+```

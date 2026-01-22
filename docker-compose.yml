@@ -63,6 +63,29 @@ services:
       retries: 3
       start_period: 15s
 
+  dashboard:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: vanna-dashboard
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      DASHBOARD_PASSKEY: ${DASHBOARD_PASSKEY:-changeme}
+      DASHBOARD_PORT: 8080
+    ports:
+      - "8080:8080"
+    command: python dashboard.py
+    depends_on:
+      - app
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
 volumes:
   mysql_data:
   chroma_data:
