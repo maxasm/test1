@@ -145,7 +145,14 @@ class SSLMySQLRunner(MySQLRunner):
                 ssl_ca=self._ssl_ca,
                 error=str(e),
             )
-            raise
+            if isinstance(e, FileNotFoundError):
+                raise RuntimeError(
+                    f"MySQL SSL CA file not found: {e}. "
+                    "If you set MYSQL_DO_SSL_CA, ensure the file exists on the host and is mounted into the container at that exact path."
+                ) from e
+            raise RuntimeError(
+                f"MySQL connection failed (host={self._host}, port={self._port}, database={self._database}, ssl={'on' if self._ssl_ca else 'off'}): {e}"
+            ) from e
 
         try:
             with conn.cursor() as cursor:
@@ -163,7 +170,7 @@ class SSLMySQLRunner(MySQLRunner):
                 sql=sql_text,
                 error=str(e),
             )
-            raise
+            raise RuntimeError(f"MySQL query failed: {e}") from e
         finally:
             try:
                 conn.close()
@@ -494,6 +501,7 @@ Pass user identity via headers:
     
     add_training_endpoints(app, agent)
     add_chat_endpoint(app, agent)
+    add_chat_sse_endpoint(app)
     
     logger.info("server_starting", host=host, port=port)
     
@@ -732,6 +740,288 @@ Be concise and helpful."""
         except Exception as e:
             logger.error("chat_sync_failed", error=str(e))
             raise HTTPException(status_code=500, detail=str(e))
+
+
+# -----------------------------------------------------------------------------
+# Streaming Chat Endpoint (SSE, UI-compatible)
+# -----------------------------------------------------------------------------
+def add_chat_sse_endpoint(app):
+    from fastapi import Request
+    from fastapi.responses import StreamingResponse
+    import uuid
+    import time
+    import datetime
+    import openai
+
+    openai_api_key = get_required_env("OPENAI_API_KEY", ["OPENAI_API_PROJECT_KEY"])
+    openai_model = get_env("OPENAI_MODEL", "gpt-4")
+
+    mysql_host = get_required_env("MYSQL_DO_HOST", ["MYSQL_HOST"])
+    mysql_port = int(get_env("MYSQL_DO_PORT", "3306", ["MYSQL_PORT"]))
+    mysql_user = get_required_env("MYSQL_DO_USER", ["MYSQL_USER"])
+    mysql_password = get_required_env("MYSQL_DO_PASSWORD", ["MYSQL_PASSWORD"])
+    mysql_database = get_required_env("MYSQL_DO_DATABASE", ["MYSQL_DATABASE"])
+    mysql_ssl_ca = os.getenv("MYSQL_DO_SSL_CA")
+    mysql_ssl_config = {"ca": mysql_ssl_ca} if mysql_ssl_ca else None
+
+    client = openai.OpenAI(api_key=openai_api_key)
+
+    def _now_iso() -> str:
+        return datetime.datetime.utcnow().replace(tzinfo=datetime.timezone.utc).isoformat()
+
+    def _sse_event(payload: dict) -> str:
+        return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+    def _rich_base(*, event_id: str, event_type: str, data: dict):
+        return {
+            "id": event_id,
+            "type": event_type,
+            "lifecycle": "create",
+            "children": [],
+            "timestamp": _now_iso(),
+            "visible": True,
+            "interactive": False,
+            "data": data,
+        }
+
+    def _simple_text(text: str) -> dict:
+        return {"type": "text", "semantic_type": None, "metadata": None, "text": text}
+
+    def _execute_sql(sql: str) -> tuple[list | None, str | None]:
+        try:
+            conn = pymysql.connect(
+                host=mysql_host,
+                port=mysql_port,
+                user=mysql_user,
+                password=mysql_password,
+                database=mysql_database,
+                ssl=mysql_ssl_config,
+                cursorclass=pymysql.cursors.DictCursor,
+            )
+            cursor = conn.cursor()
+            cursor.execute(sql)
+            results = cursor.fetchall()
+            conn.close()
+            return list(results), None
+        except Exception as e:
+            return None, str(e)
+
+    def _get_database_schema() -> str:
+        try:
+            conn = pymysql.connect(
+                host=mysql_host,
+                port=mysql_port,
+                user=mysql_user,
+                password=mysql_password,
+                database=mysql_database,
+                ssl=mysql_ssl_config,
+            )
+            cursor = conn.cursor()
+            cursor.execute("SHOW TABLES")
+            tables = [row[0] for row in cursor.fetchall()]
+
+            schema_parts = []
+            for table in tables:
+                cursor.execute(f"DESCRIBE `{table}`")
+                columns = cursor.fetchall()
+                col_defs = [f"  {col[0]} {col[1]}" for col in columns]
+                schema_parts.append(f"Table: {table}\n" + "\n".join(col_defs))
+
+            conn.close()
+            return "\n\n".join(schema_parts)
+        except Exception as e:
+            logger.error("schema_fetch_failed", error=str(e))
+            return f"Error fetching schema: {str(e)}"
+
+    @app.post("/api/vanna/v2/chat_sse", tags=["Chat"])
+    async def chat_sse(request: Request):
+        body = await request.json()
+        message = (body.get("message") or "").strip()
+        conversation_id = (
+            request.headers.get("X-Conversation-Id")
+            or request.cookies.get("vanna_conversation_id")
+            or body.get("conversation_id")
+            or f"conv_{uuid.uuid4().hex[:8]}"
+        )
+        request_id = str(uuid.uuid4())
+
+        async def event_stream():
+            yield _sse_event(
+                {
+                    "rich": _rich_base(
+                        event_id="vanna-status-bar",
+                        event_type="status_bar_update",
+                        data={
+                            "status": "working",
+                            "message": "Processing your request...",
+                            "detail": "Analyzing query",
+                        },
+                    ),
+                    "simple": None,
+                    "conversation_id": conversation_id,
+                    "request_id": request_id,
+                    "timestamp": time.time(),
+                }
+            )
+
+            task_id = str(uuid.uuid4())
+            yield _sse_event(
+                {
+                    "rich": _rich_base(
+                        event_id="vanna-task-tracker",
+                        event_type="task_tracker_update",
+                        data={
+                            "operation": "add_task",
+                            "task": {
+                                "id": task_id,
+                                "title": "Generate SQL",
+                                "description": "Generating a SQL query for your question",
+                                "status": "pending",
+                                "progress": None,
+                                "created_at": _now_iso(),
+                                "completed_at": None,
+                                "metadata": {},
+                            },
+                            "task_id": None,
+                            "status": None,
+                            "progress": None,
+                            "detail": None,
+                        },
+                    ),
+                    "simple": None,
+                    "conversation_id": conversation_id,
+                    "request_id": request_id,
+                    "timestamp": time.time(),
+                }
+            )
+
+            schema = _get_database_schema()
+            system_prompt = (
+                "You are a helpful SQL assistant. You help users query a MySQL database.\n\n"
+                f"Here is the database schema:\n{schema}\n\n"
+                "When the user asks a question:\n"
+                "1. Understand what data they need\n"
+                "2. Generate a valid MySQL query to get that data\n"
+                "3. Always wrap your SQL in ```sql and ``` code blocks\n"
+                "4. Explain what the query does\n\n"
+                "Be concise and helpful."
+            )
+
+            try:
+                response = client.chat.completions.create(
+                    model=openai_model,
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": message},
+                    ],
+                    temperature=0.1,
+                )
+                ai_response = response.choices[0].message.content
+            except Exception as e:
+                err_text = f"LLM request failed: {e}"
+                yield _sse_event(
+                    {
+                        "rich": _rich_base(
+                            event_id=str(uuid.uuid4()),
+                            event_type="text",
+                            data={"content": err_text, "markdown": True, "code_language": None, "font_size": None, "font_weight": None, "text_align": None},
+                        ),
+                        "simple": _simple_text(err_text),
+                        "conversation_id": conversation_id,
+                        "request_id": request_id,
+                        "timestamp": time.time(),
+                    }
+                )
+                yield "data: [DONE]\n\n"
+                return
+
+            yield _sse_event(
+                {
+                    "rich": _rich_base(
+                        event_id="vanna-task-tracker",
+                        event_type="task_tracker_update",
+                        data={
+                            "operation": "update_task",
+                            "task": None,
+                            "task_id": task_id,
+                            "status": "completed",
+                            "progress": None,
+                            "detail": None,
+                        },
+                    ),
+                    "simple": None,
+                    "conversation_id": conversation_id,
+                    "request_id": request_id,
+                    "timestamp": time.time(),
+                }
+            )
+
+            # Extract SQL and execute it (best-effort), similar to /api/chat
+            sql_query = None
+            sql_error = None
+            data = None
+            if isinstance(ai_response, str) and "```sql" in ai_response:
+                import re
+
+                sql_match = re.search(r"```sql\s*(.*?)\s*```", ai_response, re.DOTALL)
+                if sql_match:
+                    sql_query = sql_match.group(1).strip()
+                    if sql_query:
+                        data, sql_error = _execute_sql(sql_query)
+
+            final_text = ai_response or ""
+            if sql_error:
+                final_text = (final_text + f"\n\n**SQL Execution Error:** {sql_error}").strip()
+
+            yield _sse_event(
+                {
+                    "rich": _rich_base(
+                        event_id="vanna-status-bar",
+                        event_type="status_bar_update",
+                        data={
+                            "status": "idle",
+                            "message": "Response complete",
+                            "detail": "Ready for next message",
+                        },
+                    ),
+                    "simple": None,
+                    "conversation_id": conversation_id,
+                    "request_id": request_id,
+                    "timestamp": time.time(),
+                }
+            )
+
+            yield _sse_event(
+                {
+                    "rich": _rich_base(
+                        event_id="vanna-chat-input",
+                        event_type="chat_input_update",
+                        data={"placeholder": "Ask a follow-up question...", "disabled": False, "value": None, "focus": None},
+                    ),
+                    "simple": None,
+                    "conversation_id": conversation_id,
+                    "request_id": request_id,
+                    "timestamp": time.time(),
+                }
+            )
+
+            yield _sse_event(
+                {
+                    "rich": _rich_base(
+                        event_id=str(uuid.uuid4()),
+                        event_type="text",
+                        data={"content": final_text, "markdown": True, "code_language": None, "font_size": None, "font_weight": None, "text_align": None},
+                    ),
+                    "simple": _simple_text(final_text),
+                    "conversation_id": conversation_id,
+                    "request_id": request_id,
+                    "timestamp": time.time(),
+                }
+            )
+
+            yield "data: [DONE]\n\n"
+
+        return StreamingResponse(event_stream(), media_type="text/event-stream")
 
 
 # -----------------------------------------------------------------------------
