@@ -839,6 +839,31 @@ def add_chat_sse_endpoint(app):
 
     client = openai.OpenAI(api_key=openai_api_key)
 
+    def normalize_generated_sql(sql: str) -> str:
+        """Normalize LLM-generated SQL to avoid placeholders and improve MySQL compatibility."""
+        if not sql:
+            return sql
+
+        normalized = sql.strip()
+        normalized = normalized.replace("your_database_name", mysql_database)
+        normalized = normalized.replace("<database_name>", mysql_database)
+        normalized = normalized.replace("database_name", mysql_database)
+
+        import re
+
+        normalized = re.sub(
+            r"(?is)^\\s*SHOW\\s+TABLES\\s+(IN|FROM)\\s+`?" + re.escape(mysql_database) + r"`?\\s*;?\\s*$",
+            "SHOW TABLES;",
+            normalized,
+        )
+        normalized = re.sub(
+            r"(?is)^\\s*SHOW\\s+TABLES\\s+(IN|FROM)\\s+`?your_database_name`?\\s*;?\\s*$",
+            "SHOW TABLES;",
+            normalized,
+        )
+
+        return normalized
+
     def _now_iso() -> str:
         return datetime.datetime.utcnow().replace(tzinfo=datetime.timezone.utc).isoformat()
 
@@ -919,72 +944,72 @@ def add_chat_sse_endpoint(app):
         request_id = str(uuid.uuid4())
 
         async def event_stream():
-            yield _sse_event(
-                {
-                    "rich": _rich_base(
-                        event_id="vanna-status-bar",
-                        event_type="status_bar_update",
-                        data={
-                            "status": "working",
-                            "message": "Processing your request...",
-                            "detail": "Analyzing query",
-                        },
-                    ),
-                    "simple": None,
-                    "conversation_id": conversation_id,
-                    "request_id": request_id,
-                    "timestamp": time.time(),
-                }
-            )
-
-            task_id = str(uuid.uuid4())
-            yield _sse_event(
-                {
-                    "rich": _rich_base(
-                        event_id="vanna-task-tracker",
-                        event_type="task_tracker_update",
-                        data={
-                            "operation": "add_task",
-                            "task": {
-                                "id": task_id,
-                                "title": "Generate SQL",
-                                "description": "Generating a SQL query for your question",
-                                "status": "pending",
-                                "progress": None,
-                                "created_at": _now_iso(),
-                                "completed_at": None,
-                                "metadata": {},
-                            },
-                            "task_id": None,
-                            "status": None,
-                            "progress": None,
-                            "detail": None,
-                        },
-                    ),
-                    "simple": None,
-                    "conversation_id": conversation_id,
-                    "request_id": request_id,
-                    "timestamp": time.time(),
-                }
-            )
-
-            schema = _get_database_schema()
-            system_prompt = (
-                "You are a helpful SQL assistant. You help users query a MySQL database.\n\n"
-                f"The current database name is: {mysql_database}\n\n"
-                f"Here is the database schema:\n{schema}\n\n"
-                "When the user asks a question:\n"
-                "1. Understand what data they need\n"
-                "2. Generate a valid MySQL query to get that data\n"
-                "3. Always wrap your SQL in ```sql and ``` code blocks\n"
-                "4. Explain what the query does\n\n"
-                "Important:\n"
-                "- Do NOT use placeholders like 'your_database_name'.\n"
-                "- Use the current database implicitly (e.g. use `SHOW TABLES;` instead of `SHOW TABLES IN ...`).\n\n"
-                "Be concise and helpful."
-            )
-
             try:
+                yield _sse_event(
+                    {
+                        "rich": _rich_base(
+                            event_id="vanna-status-bar",
+                            event_type="status_bar_update",
+                            data={
+                                "status": "working",
+                                "message": "Processing your request...",
+                                "detail": "Analyzing query",
+                            },
+                        ),
+                        "simple": None,
+                        "conversation_id": conversation_id,
+                        "request_id": request_id,
+                        "timestamp": time.time(),
+                    }
+                )
+
+                task_id = str(uuid.uuid4())
+                yield _sse_event(
+                    {
+                        "rich": _rich_base(
+                            event_id="vanna-task-tracker",
+                            event_type="task_tracker_update",
+                            data={
+                                "operation": "add_task",
+                                "task": {
+                                    "id": task_id,
+                                    "title": "Generate SQL",
+                                    "description": "Generating a SQL query for your question",
+                                    "status": "pending",
+                                    "progress": None,
+                                    "created_at": _now_iso(),
+                                    "completed_at": None,
+                                    "metadata": {},
+                                },
+                                "task_id": None,
+                                "status": None,
+                                "progress": None,
+                                "detail": None,
+                            },
+                        ),
+                        "simple": None,
+                        "conversation_id": conversation_id,
+                        "request_id": request_id,
+                        "timestamp": time.time(),
+                    }
+                )
+
+                schema = _get_database_schema()
+                system_prompt = (
+                    "You are a helpful SQL assistant. You help users query a MySQL database.\n\n"
+                    f"The current database name is: {mysql_database}\n\n"
+                    f"Here is the database schema:\n{schema}\n\n"
+                    "When the user asks a question:\n"
+                    "1. Understand what data they need\n"
+                    "2. Generate a valid MySQL query to get that data\n"
+                    "3. Always wrap your SQL in ```sql and ``` code blocks\n"
+                    "4. Explain what the query does\n\n"
+                    "Important:\n"
+                    "- Do NOT use placeholders like 'your_database_name'.\n"
+                    "- Use the current database implicitly (e.g. use `SHOW TABLES;` instead of `SHOW TABLES IN ...`).\n\n"
+                    "Be concise and helpful."
+                )
+
                 response = client.chat.completions.create(
                     model=openai_model,
                     messages=[
@@ -994,8 +1019,95 @@ def add_chat_sse_endpoint(app):
                     temperature=0.1,
                 )
                 ai_response = response.choices[0].message.content
+
+                yield _sse_event(
+                    {
+                        "rich": _rich_base(
+                            event_id="vanna-task-tracker",
+                            event_type="task_tracker_update",
+                            data={
+                                "operation": "update_task",
+                                "task": None,
+                                "task_id": task_id,
+                                "status": "completed",
+                                "progress": None,
+                                "detail": None,
+                            },
+                        ),
+                        "simple": None,
+                        "conversation_id": conversation_id,
+                        "request_id": request_id,
+                        "timestamp": time.time(),
+                    }
+                )
+
+                # Extract SQL and execute it (best-effort), similar to /api/chat
+                sql_query = None
+                sql_error = None
+                data = None
+                if isinstance(ai_response, str) and "```sql" in ai_response:
+                    import re
+
+                    sql_match = re.search(r"```sql\s*(.*?)\s*```", ai_response, re.DOTALL)
+                    if sql_match:
+                        sql_query = normalize_generated_sql(sql_match.group(1).strip())
+                        if sql_query:
+                            data, sql_error = _execute_sql(sql_query)
+
+                final_text = ai_response or ""
+                if sql_error:
+                    final_text = (final_text + f"\n\n**SQL Execution Error:** {sql_error}").strip()
+
+                yield _sse_event(
+                    {
+                        "rich": _rich_base(
+                            event_id="vanna-status-bar",
+                            event_type="status_bar_update",
+                            data={
+                                "status": "idle",
+                                "message": "Response complete",
+                                "detail": "Ready for next message",
+                            },
+                        ),
+                        "simple": None,
+                        "conversation_id": conversation_id,
+                        "request_id": request_id,
+                        "timestamp": time.time(),
+                    }
+                )
+
+                yield _sse_event(
+                    {
+                        "rich": _rich_base(
+                            event_id="vanna-chat-input",
+                            event_type="chat_input_update",
+                            data={"placeholder": "Ask a follow-up question...", "disabled": False, "value": None, "focus": None},
+                        ),
+                        "simple": None,
+                        "conversation_id": conversation_id,
+                        "request_id": request_id,
+                        "timestamp": time.time(),
+                    }
+                )
+
+                yield _sse_event(
+                    {
+                        "rich": _rich_base(
+                            event_id=str(uuid.uuid4()),
+                            event_type="text",
+                            data={"content": final_text, "markdown": True, "code_language": None, "font_size": None, "font_weight": None, "text_align": None},
+                        ),
+                        "simple": _simple_text(final_text),
+                        "conversation_id": conversation_id,
+                        "request_id": request_id,
+                        "timestamp": time.time(),
+                    }
+                )
+
+                yield "data: [DONE]\n\n"
             except Exception as e:
-                err_text = f"LLM request failed: {e}"
+                err_text = f"SSE handler failed: {e}"
+                logger.error("chat_sse_failed", error=str(e))
                 yield _sse_event(
                     {
                         "rich": _rich_base(
@@ -1010,93 +1122,6 @@ def add_chat_sse_endpoint(app):
                     }
                 )
                 yield "data: [DONE]\n\n"
-                return
-
-            yield _sse_event(
-                {
-                    "rich": _rich_base(
-                        event_id="vanna-task-tracker",
-                        event_type="task_tracker_update",
-                        data={
-                            "operation": "update_task",
-                            "task": None,
-                            "task_id": task_id,
-                            "status": "completed",
-                            "progress": None,
-                            "detail": None,
-                        },
-                    ),
-                    "simple": None,
-                    "conversation_id": conversation_id,
-                    "request_id": request_id,
-                    "timestamp": time.time(),
-                }
-            )
-
-            # Extract SQL and execute it (best-effort), similar to /api/chat
-            sql_query = None
-            sql_error = None
-            data = None
-            if isinstance(ai_response, str) and "```sql" in ai_response:
-                import re
-
-                sql_match = re.search(r"```sql\s*(.*?)\s*```", ai_response, re.DOTALL)
-                if sql_match:
-                    sql_query = normalize_generated_sql(sql_match.group(1).strip())
-                    if sql_query:
-                        data, sql_error = _execute_sql(sql_query)
-
-            final_text = ai_response or ""
-            if sql_error:
-                final_text = (final_text + f"\n\n**SQL Execution Error:** {sql_error}").strip()
-
-            yield _sse_event(
-                {
-                    "rich": _rich_base(
-                        event_id="vanna-status-bar",
-                        event_type="status_bar_update",
-                        data={
-                            "status": "idle",
-                            "message": "Response complete",
-                            "detail": "Ready for next message",
-                        },
-                    ),
-                    "simple": None,
-                    "conversation_id": conversation_id,
-                    "request_id": request_id,
-                    "timestamp": time.time(),
-                }
-            )
-
-            yield _sse_event(
-                {
-                    "rich": _rich_base(
-                        event_id="vanna-chat-input",
-                        event_type="chat_input_update",
-                        data={"placeholder": "Ask a follow-up question...", "disabled": False, "value": None, "focus": None},
-                    ),
-                    "simple": None,
-                    "conversation_id": conversation_id,
-                    "request_id": request_id,
-                    "timestamp": time.time(),
-                }
-            )
-
-            yield _sse_event(
-                {
-                    "rich": _rich_base(
-                        event_id=str(uuid.uuid4()),
-                        event_type="text",
-                        data={"content": final_text, "markdown": True, "code_language": None, "font_size": None, "font_weight": None, "text_align": None},
-                    ),
-                    "simple": _simple_text(final_text),
-                    "conversation_id": conversation_id,
-                    "request_id": request_id,
-                    "timestamp": time.time(),
-                }
-            )
-
-            yield "data: [DONE]\n\n"
 
         return StreamingResponse(event_stream(), media_type="text/event-stream")
 
