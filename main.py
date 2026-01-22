@@ -538,6 +538,30 @@ def add_chat_endpoint(app, agent: Agent):
     
     # Create OpenAI client
     client = openai.OpenAI(api_key=openai_api_key)
+
+    def normalize_generated_sql(sql: str) -> str:
+        """Normalize LLM-generated SQL to avoid placeholders and improve MySQL compatibility."""
+        if not sql:
+            return sql
+
+        normalized = sql.strip()
+        normalized = normalized.replace("your_database_name", mysql_database)
+        normalized = normalized.replace("<database_name>", mysql_database)
+        normalized = normalized.replace("database_name", mysql_database)
+
+        import re
+
+        normalized = re.sub(
+            r"(?is)^\\s*SHOW\\s+TABLES\\s+(IN|FROM)\\s+`?" + re.escape(mysql_database) + r"`?\\s*;?\\s*$",
+            "SHOW TABLES;",
+            normalized,
+        )
+        normalized = re.sub(
+            r"(?is)^\\s*SHOW\\s+TABLES\\s+(IN|FROM)\\s+`?your_database_name`?\\s*;?\\s*$",
+            "SHOW TABLES;",
+            normalized,
+        )
+        return normalized
     
     class ChatRequest(BaseModel):
         """Request body for the chat endpoint."""
@@ -629,6 +653,34 @@ def add_chat_endpoint(app, agent: Agent):
             return list(results), None
         except Exception as e:
             return None, str(e)
+
+    def normalize_generated_sql(sql: str) -> str:
+        """Normalize LLM-generated SQL to avoid placeholders and improve MySQL compatibility."""
+        if not sql:
+            return sql
+
+        normalized = sql.strip()
+        # Common placeholder patterns from LLMs
+        normalized = normalized.replace("your_database_name", mysql_database)
+        normalized = normalized.replace("<database_name>", mysql_database)
+        normalized = normalized.replace("database_name", mysql_database)
+
+        # In MySQL, SHOW TABLES; lists tables for the current database.
+        # Some models generate SHOW TABLES IN/FROM <db>; which can introduce placeholders.
+        import re
+
+        normalized = re.sub(
+            r"(?is)^\\s*SHOW\\s+TABLES\\s+(IN|FROM)\\s+`?" + re.escape(mysql_database) + r"`?\\s*;?\\s*$",
+            "SHOW TABLES;",
+            normalized,
+        )
+        normalized = re.sub(
+            r"(?is)^\\s*SHOW\\s+TABLES\\s+(IN|FROM)\\s+`?your_database_name`?\\s*;?\\s*$",
+            "SHOW TABLES;",
+            normalized,
+        )
+
+        return normalized
     
     @app.post("/api/chat", response_model=ChatResponse, tags=["Chat"])
     async def chat_sync(chat_request: ChatRequest):
@@ -655,6 +707,8 @@ def add_chat_endpoint(app, agent: Agent):
             # Build the prompt
             system_prompt = f"""You are a helpful SQL assistant. You help users query a MySQL database.
 
+The current database name is: {mysql_database}
+
 Here is the database schema:
 {schema}
 
@@ -663,6 +717,10 @@ When the user asks a question:
 2. Generate a valid MySQL query to get that data
 3. Always wrap your SQL in ```sql and ``` code blocks
 4. Explain what the query does
+
+Important:
+- Do NOT use placeholders like 'your_database_name'.
+- Use the current database implicitly (e.g. use `SHOW TABLES;` instead of `SHOW TABLES IN ...`).
 
 Be concise and helpful."""
 
@@ -688,7 +746,7 @@ Be concise and helpful."""
                 import re
                 sql_match = re.search(r"```sql\s*(.*?)\s*```", ai_response, re.DOTALL)
                 if sql_match:
-                    sql_query = sql_match.group(1).strip()
+                    sql_query = normalize_generated_sql(sql_match.group(1).strip())
                     
                     # Execute SQL if requested
                     if chat_request.run_sql and sql_query:
@@ -752,6 +810,21 @@ def add_chat_sse_endpoint(app):
     import time
     import datetime
     import openai
+
+    # VannaFastAPIServer registers its own /api/vanna/v2/chat_sse route.
+    # FastAPI does not “override” earlier routes with the same path+method.
+    # Remove the existing route so our manual SSE implementation is used.
+    try:
+        to_keep = []
+        for r in list(getattr(app.router, "routes", [])):
+            path = getattr(r, "path", None)
+            methods = set(getattr(r, "methods", []) or [])
+            if path == "/api/vanna/v2/chat_sse" and "POST" in methods:
+                continue
+            to_keep.append(r)
+        app.router.routes = to_keep
+    except Exception as e:
+        logger.error("chat_sse_route_override_failed", error=str(e))
 
     openai_api_key = get_required_env("OPENAI_API_KEY", ["OPENAI_API_PROJECT_KEY"])
     openai_model = get_env("OPENAI_MODEL", "gpt-4")
@@ -898,12 +971,16 @@ def add_chat_sse_endpoint(app):
             schema = _get_database_schema()
             system_prompt = (
                 "You are a helpful SQL assistant. You help users query a MySQL database.\n\n"
+                f"The current database name is: {mysql_database}\n\n"
                 f"Here is the database schema:\n{schema}\n\n"
                 "When the user asks a question:\n"
                 "1. Understand what data they need\n"
                 "2. Generate a valid MySQL query to get that data\n"
                 "3. Always wrap your SQL in ```sql and ``` code blocks\n"
                 "4. Explain what the query does\n\n"
+                "Important:\n"
+                "- Do NOT use placeholders like 'your_database_name'.\n"
+                "- Use the current database implicitly (e.g. use `SHOW TABLES;` instead of `SHOW TABLES IN ...`).\n\n"
                 "Be concise and helpful."
             )
 
@@ -965,7 +1042,7 @@ def add_chat_sse_endpoint(app):
 
                 sql_match = re.search(r"```sql\s*(.*?)\s*```", ai_response, re.DOTALL)
                 if sql_match:
-                    sql_query = sql_match.group(1).strip()
+                    sql_query = normalize_generated_sql(sql_match.group(1).strip())
                     if sql_query:
                         data, sql_error = _execute_sql(sql_query)
 
