@@ -435,6 +435,34 @@ DASHBOARD_TEMPLATE = """
             </div>
         </div>
 
+        <!-- Management -->
+        <div class="bg-white/10 backdrop-blur-lg rounded-xl p-6 border border-white/10 mb-8">
+            <h2 class="text-xl font-bold text-white mb-4">Management</h2>
+            <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                <a href="{{ url_for('memories') }}"
+                    class="flex items-center gap-3 p-4 bg-white/5 hover:bg-white/10 rounded-lg transition border border-white/10">
+                    <div class="w-10 h-10 bg-purple-500/20 rounded-lg flex items-center justify-center">
+                        <i class="fas fa-brain text-purple-400"></i>
+                    </div>
+                    <div>
+                        <p class="text-white font-medium">Persistent Memories</p>
+                        <p class="text-gray-400 text-sm">View, add, and delete text memories</p>
+                    </div>
+                </a>
+                
+                <a href="{{ url_for('golden_queries') }}"
+                    class="flex items-center gap-3 p-4 bg-white/5 hover:bg-white/10 rounded-lg transition border border-white/10">
+                    <div class="w-10 h-10 bg-pink-500/20 rounded-lg flex items-center justify-center">
+                        <i class="fas fa-star text-pink-400"></i>
+                    </div>
+                    <div>
+                        <p class="text-white font-medium">Golden Queries</p>
+                        <p class="text-gray-400 text-sm">Manage canonical question + SQL pairs</p>
+                    </div>
+                </a>
+            </div>
+        </div>
+
         <!-- System Info -->
         <div class="bg-white/10 backdrop-blur-lg rounded-xl p-6 border border-white/10">
             <h2 class="text-xl font-bold text-white mb-4">System Information</h2>
@@ -534,25 +562,34 @@ def dashboard():
 def _api_get(path: str, params: dict | None = None) -> dict:
     url = f"{VANNA_BASE_URL}{path}"
     with httpx.Client(timeout=10.0) as client:
-        r = client.get(url, params=params)
-        r.raise_for_status()
-        return r.json()
+        try:
+            r = client.get(url, params=params)
+            r.raise_for_status()
+            return r.json()
+        except httpx.RequestError as e:
+            raise RuntimeError(f"Cannot reach Vanna API at {VANNA_BASE_URL}. Set VANNA_BASE_URL if needed. ({e})") from e
 
 
 def _api_post(path: str, json_body: dict) -> dict:
     url = f"{VANNA_BASE_URL}{path}"
     with httpx.Client(timeout=10.0) as client:
-        r = client.post(url, json=json_body)
-        r.raise_for_status()
-        return r.json() if r.text else {"status": "success"}
+        try:
+            r = client.post(url, json=json_body)
+            r.raise_for_status()
+            return r.json() if r.text else {"status": "success"}
+        except httpx.RequestError as e:
+            raise RuntimeError(f"Cannot reach Vanna API at {VANNA_BASE_URL}. Set VANNA_BASE_URL if needed. ({e})") from e
 
 
 def _api_delete(path: str) -> dict:
     url = f"{VANNA_BASE_URL}{path}"
     with httpx.Client(timeout=10.0) as client:
-        r = client.delete(url)
-        r.raise_for_status()
-        return r.json() if r.text else {"status": "success"}
+        try:
+            r = client.delete(url)
+            r.raise_for_status()
+            return r.json() if r.text else {"status": "success"}
+        except httpx.RequestError as e:
+            raise RuntimeError(f"Cannot reach Vanna API at {VANNA_BASE_URL}. Set VANNA_BASE_URL if needed. ({e})") from e
 
 
 @app.route('/memories')
