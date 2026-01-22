@@ -57,9 +57,6 @@ import chromadb
 from chromadb.config import Settings
 import pymysql
 
-from fastapi import Request
-from starlette.responses import StreamingResponse
-
 from training_data import get_all_training_content
 
 
@@ -150,388 +147,7 @@ class PHPFrontendUserResolver(UserResolver):
         )
 
 
-class ConversationStore:
-    def __init__(
-        self,
-        host: str,
-        port: int,
-        user: str,
-        password: str,
-        database: str,
-    ):
-        self._host = host
-        self._port = port
-        self._user = user
-        self._password = password
-        self._database = database
 
-    def _connect(self):
-        return pymysql.connect(
-            host=self._host,
-            port=self._port,
-            user=self._user,
-            password=self._password,
-            database=self._database,
-            charset="utf8mb4",
-            cursorclass=pymysql.cursors.DictCursor,
-            autocommit=True,
-        )
-
-    def migrate(self) -> None:
-        conn = self._connect()
-        try:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    CREATE TABLE IF NOT EXISTS conversation_messages (
-                      id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
-                      user_id VARCHAR(255) NOT NULL,
-                      conversation_id VARCHAR(255) NOT NULL,
-                      role ENUM('user','assistant','system','tool') NOT NULL,
-                      content LONGTEXT NOT NULL,
-                      created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                      PRIMARY KEY (id),
-                      KEY ix_conv_messages_user_conv_created (user_id, conversation_id, created_at)
-                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-                    """
-                )
-                cur.execute(
-                    """
-                    CREATE TABLE IF NOT EXISTS conversation_events (
-                      id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
-                      user_id VARCHAR(255) NOT NULL,
-                      conversation_id VARCHAR(255) NOT NULL,
-                      event_type VARCHAR(100) NOT NULL,
-                      event_json JSON NULL,
-                      created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                      PRIMARY KEY (id),
-                      KEY ix_conv_events_user_conv_created (user_id, conversation_id, created_at)
-                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-                    """
-                )
-        finally:
-            conn.close()
-
-    def append_message(self, user_id: str, conversation_id: str, role: str, content: str) -> None:
-        conn = self._connect()
-        try:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    INSERT INTO conversation_messages (user_id, conversation_id, role, content)
-                    VALUES (%s, %s, %s, %s)
-                    """,
-                    (user_id, conversation_id, role, content),
-                )
-        finally:
-            conn.close()
-
-    def append_event(self, user_id: str, conversation_id: str, event_type: str, event_json) -> None:
-        conn = self._connect()
-        try:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    INSERT INTO conversation_events (user_id, conversation_id, event_type, event_json)
-                    VALUES (%s, %s, %s, %s)
-                    """,
-                    (user_id, conversation_id, event_type, json.dumps(event_json) if event_json is not None else None),
-                )
-        finally:
-            conn.close()
-
-    def get_recent_messages(self, user_id: str, conversation_id: str, limit: int) -> list[dict]:
-        conn = self._connect()
-        try:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    SELECT role, content, created_at
-                    FROM conversation_messages
-                    WHERE user_id = %s AND conversation_id = %s
-                    ORDER BY created_at DESC, id DESC
-                    LIMIT %s
-                    """,
-                    (user_id, conversation_id, limit),
-                )
-                rows = cur.fetchall()
-                return list(reversed(rows))
-        finally:
-            conn.close()
-
-    def get_recent_events(self, user_id: str, conversation_id: str, limit: int) -> list[dict]:
-        conn = self._connect()
-        try:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    SELECT event_type, event_json, created_at
-                    FROM conversation_events
-                    WHERE user_id = %s AND conversation_id = %s
-                    ORDER BY created_at DESC, id DESC
-                    LIMIT %s
-                    """,
-                    (user_id, conversation_id, limit),
-                )
-                rows = cur.fetchall()
-                return list(reversed(rows))
-        finally:
-            conn.close()
-
-    def clear_conversation(self, user_id: str, conversation_id: str) -> None:
-        conn = self._connect()
-        try:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "DELETE FROM conversation_messages WHERE user_id = %s AND conversation_id = %s",
-                    (user_id, conversation_id),
-                )
-                cur.execute(
-                    "DELETE FROM conversation_events WHERE user_id = %s AND conversation_id = %s",
-                    (user_id, conversation_id),
-                )
-        finally:
-            conn.close()
-
-
-def _extract_user_and_conversation_from_request(request: Request) -> tuple[str, str]:
-    user_id = request.headers.get("X-User-Id") or request.cookies.get("vanna_user") or "anonymous"
-    conversation_id = (
-        request.headers.get("X-Conversation-Id")
-        or request.cookies.get("vanna_conversation_id")
-        or "default"
-    )
-    return user_id, conversation_id
-
-
-def _format_history(messages: list[dict]) -> str:
-    parts: list[str] = []
-    for m in messages:
-        role = m.get("role")
-        content = m.get("content")
-        if not content:
-            continue
-        if role == "user":
-            parts.append(f"User: {content}")
-        elif role == "assistant":
-            parts.append(f"Assistant: {content}")
-        elif role == "tool":
-            parts.append(f"Tool: {content}")
-        else:
-            parts.append(f"System: {content}")
-    return "\n".join(parts).strip()
-
-
-class ConversationContextMiddleware:
-    """
-    Pure ASGI middleware for conversation context injection.
-    Avoids BaseHTTPMiddleware issues with body consumption and streaming.
-    """
-
-    def __init__(self, app, store: ConversationStore, history_limit: int, max_assistant_chars: int):
-        self.app = app
-        self.store = store
-        self.history_limit = history_limit
-        self.max_assistant_chars = max_assistant_chars
-
-    async def __call__(self, scope, receive, send):
-        if scope["type"] != "http":
-            await self.app(scope, receive, send)
-            return
-
-        method = scope.get("method", "").upper()
-        path = scope.get("path", "")
-
-        if method != "POST" or path != "/api/vanna/v2/chat_sse":
-            await self.app(scope, receive, send)
-            return
-
-        headers = dict(scope.get("headers", []))
-        user_id = headers.get(b"x-user-id", b"").decode("utf-8") or "anonymous"
-        conversation_id = headers.get(b"x-conversation-id", b"").decode("utf-8") or "default"
-
-        body_parts = []
-        while True:
-            message = await receive()
-            body_parts.append(message.get("body", b""))
-            if not message.get("more_body", False):
-                break
-
-        raw_body = b"".join(body_parts)
-
-        try:
-            payload = json.loads(raw_body.decode("utf-8")) if raw_body else {}
-        except Exception:
-            payload = {}
-
-        original_message = payload.get("message") if isinstance(payload, dict) else None
-        new_body = raw_body
-
-        if isinstance(original_message, str) and original_message.strip():
-            try:
-                self.store.append_message(
-                    user_id=user_id,
-                    conversation_id=conversation_id,
-                    role="user",
-                    content=original_message,
-                )
-            except Exception as e:
-                logger.error("conversation_store_append_user_failed", error=str(e))
-
-            try:
-                recent = self.store.get_recent_messages(
-                    user_id=user_id,
-                    conversation_id=conversation_id,
-                    limit=self.history_limit,
-                )
-            except Exception as e:
-                logger.error("conversation_store_read_failed", error=str(e))
-                recent = []
-
-            history_text = _format_history(recent[:-1])
-            if history_text:
-                payload["message"] = (
-                    "You are continuing an ongoing conversation. Use the prior messages as context.\n\n"
-                    + history_text
-                    + "\n\nCurrent user message: "
-                    + original_message
-                )
-                new_body = json.dumps(payload).encode("utf-8")
-
-        body_sent = False
-
-        async def wrapped_receive():
-            nonlocal body_sent
-            if not body_sent:
-                body_sent = True
-                return {"type": "http.request", "body": new_body, "more_body": False}
-            while True:
-                msg = await receive()
-                if msg["type"] == "http.disconnect":
-                    return msg
-
-        assistant_text_parts: list[str] = []
-
-        async def wrapped_send(message):
-            if message["type"] == "http.response.start":
-                await send(message)
-                return
-
-            if message["type"] == "http.response.body":
-                body = message.get("body", b"")
-
-                if body:
-                    try:
-                        text = body.decode("utf-8") if isinstance(body, bytes) else body
-                        for line in text.split("\n"):
-                            if line.startswith("data:"):
-                                data = line[5:].strip()
-                                if data and data != "[DONE]":
-                                    try:
-                                        event = json.loads(data)
-                                        try:
-                                            event_type = event.get("type") if isinstance(event, dict) else "unknown"
-                                            self.store.append_event(
-                                                user_id=user_id,
-                                                conversation_id=conversation_id,
-                                                event_type=str(event_type) if event_type else "unknown",
-                                                event_json=event,
-                                            )
-                                        except Exception as e:
-                                            logger.error("conversation_store_append_event_failed", error=str(e))
-
-                                        if isinstance(event, dict) and event.get("type") == "text":
-                                            content = event.get("content")
-                                            if isinstance(content, str) and content:
-                                                assistant_text_parts.append(content)
-                                    except json.JSONDecodeError:
-                                        pass
-                    except Exception:
-                        pass
-
-                await send(message)
-
-                if not message.get("more_body", False):
-                    assistant_text = "\n".join([p for p in assistant_text_parts if p]).strip()
-                    if assistant_text:
-                        try:
-                            self.store.append_message(
-                                user_id=user_id,
-                                conversation_id=conversation_id,
-                                role="assistant",
-                                content=assistant_text,
-                            )
-                        except Exception as e:
-                            logger.error("conversation_store_append_assistant_failed", error=str(e))
-                return
-
-            await send(message)
-
-        await self.app(scope, wrapped_receive, wrapped_send)
-
-
-def add_conversation_context(app, store: ConversationStore):
-    history_limit = int(get_env("CONVERSATION_HISTORY_LIMIT", "12"))
-    max_assistant_chars = int(get_env("CONVERSATION_ASSISTANT_MAX_CHARS", "20000"))
-
-    @app.on_event("startup")
-    async def _startup_migrate():
-        store.migrate()
-
-    app.add_middleware(
-        ConversationContextMiddleware,
-        store=store,
-        history_limit=history_limit,
-        max_assistant_chars=max_assistant_chars,
-    )
-
-    @app.get("/api/conversation/messages")
-    async def get_conversation_messages(request: Request, limit: int = 50):
-        user_id, conversation_id = _extract_user_and_conversation_from_request(request)
-        msgs = store.get_recent_messages(user_id=user_id, conversation_id=conversation_id, limit=int(limit))
-        return {
-            "user_id": user_id,
-            "conversation_id": conversation_id,
-            "messages": [
-                {
-                    "role": m["role"],
-                    "content": m["content"],
-                    "created_at": m["created_at"].isoformat() if hasattr(m["created_at"], "isoformat") else str(m["created_at"]),
-                }
-                for m in msgs
-            ],
-        }
-
-    @app.get("/api/conversation/events")
-    async def get_conversation_events(request: Request, limit: int = 200):
-        user_id, conversation_id = _extract_user_and_conversation_from_request(request)
-        events = store.get_recent_events(user_id=user_id, conversation_id=conversation_id, limit=int(limit))
-        normalized = []
-        for e in events:
-            raw = e.get("event_json")
-            if isinstance(raw, (bytes, bytearray)):
-                try:
-                    raw = json.loads(raw.decode("utf-8"))
-                except Exception:
-                    raw = None
-            normalized.append(
-                {
-                    "event_type": e.get("event_type"),
-                    "event": raw,
-                    "created_at": e["created_at"].isoformat() if hasattr(e["created_at"], "isoformat") else str(e["created_at"]),
-                }
-            )
-        return {
-            "user_id": user_id,
-            "conversation_id": conversation_id,
-            "events": normalized,
-        }
-
-    @app.delete("/api/conversation")
-    async def clear_conversation(request: Request):
-        user_id, conversation_id = _extract_user_and_conversation_from_request(request)
-        store.clear_conversation(user_id=user_id, conversation_id=conversation_id)
-        return {"status": "success", "user_id": user_id, "conversation_id": conversation_id}
 
 
 # -----------------------------------------------------------------------------
@@ -706,20 +322,6 @@ def main() -> None:
     # Create the Vanna agent
     agent = create_vanna_agent()
 
-    mysql_host = get_required_env("MYSQL_DO_HOST", ["MYSQL_HOST"])
-    mysql_port = int(get_env("MYSQL_DO_PORT", "3306", ["MYSQL_PORT"]))
-    mysql_user = get_required_env("MYSQL_DO_USER", ["MYSQL_USER"])
-    mysql_password = get_required_env("MYSQL_DO_PASSWORD", ["MYSQL_PASSWORD"])
-    mysql_database = get_required_env("MYSQL_DO_DATABASE", ["MYSQL_DATABASE"])
-
-    conversation_store = ConversationStore(
-        host=mysql_host,
-        port=mysql_port,
-        user=mysql_user,
-        password=mysql_password,
-        database=mysql_database,
-    )
-    
     # Create and run the FastAPI server
     server = VannaFastAPIServer(
         agent=agent,
@@ -733,9 +335,32 @@ def main() -> None:
     
     # Create ASGI app and add custom training endpoints
     app = server.create_app()
+    
+    # Add API metadata for documentation
+    app.title = "Vanna AI API"
+    app.description = """
+## Natural Language to SQL API
+
+This API allows you to query your MySQL database using natural language questions.
+
+### Features
+- **Chat**: Ask questions in plain English and get SQL queries + results
+- **Training**: Seed the AI with schema documentation for better accuracy
+- **Streaming**: SSE endpoint for real-time responses (via Vanna framework)
+
+### Authentication
+Pass user identity via headers:
+- `X-User-Id`: User identifier
+- `X-Conversation-Id`: Optional conversation tracking ID
+"""
+    app.version = "2.0.0"
+    app.openapi_tags = [
+        {"name": "Chat", "description": "Natural language to SQL chat endpoints"},
+        {"name": "Training", "description": "Agent memory and training data management"},
+    ]
+    
     add_training_endpoints(app, agent)
     add_chat_endpoint(app, agent)
-    add_conversation_context(app, conversation_store)
     
     logger.info("server_starting", host=host, port=port)
     
@@ -753,7 +378,7 @@ def add_chat_endpoint(app, agent: Agent):
     No streaming, no SSE - just one request in, one response out.
     """
     from fastapi import HTTPException
-    from pydantic import BaseModel
+    from pydantic import BaseModel, Field
     import uuid
     import openai
     
@@ -772,17 +397,47 @@ def add_chat_endpoint(app, agent: Agent):
     client = openai.OpenAI(api_key=openai_api_key)
     
     class ChatRequest(BaseModel):
-        message: str
-        conversation_id: str | None = None
-        run_sql: bool = True  # Whether to execute generated SQL
+        """Request body for the chat endpoint."""
+        message: str = Field(
+            ...,
+            description="Natural language question about the database",
+            examples=["Show me all tables", "How many users signed up last month?"]
+        )
+        conversation_id: str | None = Field(
+            default=None,
+            description="Optional conversation ID for tracking. Auto-generated if not provided."
+        )
+        run_sql: bool = Field(
+            default=True,
+            description="Whether to execute the generated SQL query against the database"
+        )
     
     class ChatResponse(BaseModel):
-        response: str
-        conversation_id: str
-        request_id: str
-        sql: str | None = None
-        data: list | None = None
-        error: str | None = None
+        """Response from the chat endpoint."""
+        response: str = Field(
+            ...,
+            description="AI-generated response with explanation and SQL query"
+        )
+        conversation_id: str = Field(
+            ...,
+            description="Conversation ID for this chat session"
+        )
+        request_id: str = Field(
+            ...,
+            description="Unique identifier for this request"
+        )
+        sql: str | None = Field(
+            default=None,
+            description="Extracted SQL query from the AI response, if any"
+        )
+        data: list | None = Field(
+            default=None,
+            description="Query results as a list of dictionaries, if SQL was executed"
+        )
+        error: str | None = Field(
+            default=None,
+            description="Error message if SQL execution failed"
+        )
     
     def get_database_schema() -> str:
         """Get database schema for context."""
@@ -830,16 +485,20 @@ def add_chat_endpoint(app, agent: Agent):
         except Exception as e:
             return None, str(e)
     
-    @app.post("/api/chat", response_model=ChatResponse)
+    @app.post("/api/chat", response_model=ChatResponse, tags=["Chat"])
     async def chat_sync(chat_request: ChatRequest):
         """
-        Synchronous chat endpoint - directly calls OpenAI, no streaming.
+        Natural language to SQL chat endpoint.
         
-        1. Gets database schema
-        2. Sends user question + schema to OpenAI
-        3. Extracts SQL from response
-        4. Optionally executes SQL
-        5. Returns complete response
+        Send a natural language question about your database and receive:
+        - An AI-generated explanation
+        - The SQL query to answer your question
+        - Optionally, the query results (if run_sql is true)
+        
+        **Example questions:**
+        - "Show me all tables in the database"
+        - "How many orders were placed last month?"
+        - "What are the top 10 customers by revenue?"
         """
         try:
             conversation_id = chat_request.conversation_id or f"conv_{uuid.uuid4().hex[:8]}"
@@ -916,13 +575,29 @@ def add_training_endpoints(app, agent: Agent):
     """
     from fastapi import HTTPException
     from fastapi.responses import JSONResponse
+    from pydantic import BaseModel, Field
     import asyncio
     
-    @app.post("/api/train/seed")
+    class TrainingSeedResponse(BaseModel):
+        """Response from the training seed endpoint."""
+        status: str = Field(..., description="Status of the operation (success/error)")
+        message: str = Field(..., description="Human-readable message about the operation")
+        count: int = Field(..., description="Number of training memories seeded")
+    
+    class TrainingStatusResponse(BaseModel):
+        """Response from the training status endpoint."""
+        status: str = Field(..., description="Status of the operation (success/error)")
+        text_memory_count: int = Field(..., description="Number of text memories stored")
+        tool_memory_count: int = Field(..., description="Number of tool usage memories stored")
+    
+    @app.post("/api/train/seed", response_model=TrainingSeedResponse, tags=["Training"])
     async def seed_training_data():
         """
         Seed the agent memory with DDL documentation and example queries.
-        This improves query accuracy by providing schema context.
+        
+        This endpoint loads predefined training data (schema documentation, 
+        example queries, business rules) into the agent's memory to improve 
+        SQL generation accuracy.
         """
         try:
             training_content = get_all_training_content()
@@ -966,10 +641,13 @@ def add_training_endpoints(app, agent: Agent):
             logger.error("training_seed_failed", error=str(e))
             raise HTTPException(status_code=500, detail=str(e))
     
-    @app.get("/api/train/status")
+    @app.get("/api/train/status", response_model=TrainingStatusResponse, tags=["Training"])
     async def get_training_status():
         """
         Get the current training data status.
+        
+        Returns the count of text memories and tool usage memories 
+        currently stored in the agent's memory.
         """
         try:
             from vanna.core.tool import ToolContext
