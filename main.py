@@ -216,13 +216,18 @@ def create_vanna_agent() -> Agent:
     mysql_user = get_required_env("MYSQL_DO_USER", ["MYSQL_USER"])
     mysql_password = get_required_env("MYSQL_DO_PASSWORD", ["MYSQL_PASSWORD"])
     mysql_database = get_required_env("MYSQL_DO_DATABASE", ["MYSQL_DATABASE"])
+    mysql_ssl_ca = os.getenv("MYSQL_DO_SSL_CA")
     
     logger.info(
         "configuring_database",
         host=mysql_host,
         port=mysql_port,
         database=mysql_database,
+        ssl_enabled=bool(mysql_ssl_ca),
     )
+    
+    # Build SSL config if certificate is provided
+    mysql_ssl_config = {"ca": mysql_ssl_ca} if mysql_ssl_ca else None
     
     sql_runner = MySQLRunner(
         host=mysql_host,
@@ -230,6 +235,7 @@ def create_vanna_agent() -> Agent:
         user=mysql_user,
         password=mysql_password,
         database=mysql_database,
+        ssl=mysql_ssl_config,
     )
     
     # 3. Configure ChromaDB Agent Memory (persistent learning via HTTP)
@@ -392,6 +398,8 @@ def add_chat_endpoint(app, agent: Agent):
     mysql_user = get_required_env("MYSQL_DO_USER", ["MYSQL_USER"])
     mysql_password = get_required_env("MYSQL_DO_PASSWORD", ["MYSQL_PASSWORD"])
     mysql_database = get_required_env("MYSQL_DO_DATABASE", ["MYSQL_DATABASE"])
+    mysql_ssl_ca = os.getenv("MYSQL_DO_SSL_CA")
+    mysql_ssl_config = {"ca": mysql_ssl_ca} if mysql_ssl_ca else None
     
     # Create OpenAI client
     client = openai.OpenAI(api_key=openai_api_key)
@@ -448,6 +456,7 @@ def add_chat_endpoint(app, agent: Agent):
                 user=mysql_user,
                 password=mysql_password,
                 database=mysql_database,
+                ssl=mysql_ssl_config,
             )
             cursor = conn.cursor()
             cursor.execute("SHOW TABLES")
@@ -475,6 +484,7 @@ def add_chat_endpoint(app, agent: Agent):
                 user=mysql_user,
                 password=mysql_password,
                 database=mysql_database,
+                ssl=mysql_ssl_config,
                 cursorclass=pymysql.cursors.DictCursor,
             )
             cursor = conn.cursor()
