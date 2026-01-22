@@ -135,6 +135,14 @@ class SSLMySQLRunner(MySQLRunner):
         except Exception:
             sql_text = str(sql)
 
+        logger.info(
+            "mysql_run_sql_called",
+            sql_type=type(sql).__name__,
+            args_len=len(args),
+            kwargs_keys=sorted(list(kwargs.keys())),
+            sql_preview=(sql_text[:200] if isinstance(sql_text, str) else str(sql_text)[:200]),
+        )
+
         try:
             conn = self._get_connection()
         except Exception as e:
