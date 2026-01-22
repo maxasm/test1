@@ -101,6 +101,11 @@ class SSLMySQLRunner(MySQLRunner):
     
     def _get_connection(self):
         """Override to add SSL support to the connection."""
+        if self._ssl_ca and not os.path.exists(self._ssl_ca):
+            raise FileNotFoundError(
+                f"MYSQL_DO_SSL_CA file not found at '{self._ssl_ca}'. "
+                "Make sure it is mounted into the container at this path."
+            )
         return pymysql.connect(
             host=self._host,
             port=self._port,
@@ -112,16 +117,47 @@ class SSLMySQLRunner(MySQLRunner):
             charset="utf8mb4",
         )
     
-    def run_sql(self, sql: str) -> list[dict]:
-        """Execute SQL with SSL connection."""
-        conn = self._get_connection()
+    def run_sql(self, sql: str, *args, **kwargs) -> list[dict]:
+        """Execute SQL with SSL connection.
+
+        Accepts *args/**kwargs for compatibility with the upstream Vanna tool interface.
+        """
+        try:
+            conn = self._get_connection()
+        except Exception as e:
+            logger.error(
+                "mysql_connect_failed",
+                host=self._host,
+                port=self._port,
+                database=self._database,
+                user=self._user,
+                ssl_ca=self._ssl_ca,
+                error=str(e),
+            )
+            raise
+
         try:
             with conn.cursor() as cursor:
                 cursor.execute(sql)
                 results = cursor.fetchall()
                 return list(results)
+        except Exception as e:
+            logger.error(
+                "mysql_query_failed",
+                host=self._host,
+                port=self._port,
+                database=self._database,
+                user=self._user,
+                ssl_ca=self._ssl_ca,
+                sql=sql,
+                error=str(e),
+            )
+            raise
         finally:
-            conn.close()
+            try:
+                conn.close()
+            except Exception:
+                pass
 
 
 # -----------------------------------------------------------------------------
