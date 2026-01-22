@@ -184,8 +184,8 @@ DASHBOARD_TEMPLATE = """
         <div class="bg-white/10 backdrop-blur-lg rounded-xl p-6 border border-white/10 mb-8">
             <h2 class="text-xl font-bold text-white mb-4">Quick Actions</h2>
             <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
-                <a href="http://localhost:8000" target="_blank"
-                    class="flex items-center gap-3 p-4 bg-white/5 hover:bg-white/10 rounded-lg transition border border-white/10">
+                <a href="#" onclick="window.open(window.location.protocol + '//' + window.location.hostname + ':8000', '_blank'); return false;"
+                    class="flex items-center gap-3 p-4 bg-white/5 hover:bg-white/10 rounded-lg transition border border-white/10 cursor-pointer">
                     <div class="w-10 h-10 bg-purple-500/20 rounded-lg flex items-center justify-center">
                         <i class="fas fa-comments text-purple-400"></i>
                     </div>
@@ -195,8 +195,8 @@ DASHBOARD_TEMPLATE = """
                     </div>
                 </a>
                 
-                <a href="http://localhost:8000/docs" target="_blank"
-                    class="flex items-center gap-3 p-4 bg-white/5 hover:bg-white/10 rounded-lg transition border border-white/10">
+                <a href="#" onclick="window.open(window.location.protocol + '//' + window.location.hostname + ':8000/docs', '_blank'); return false;"
+                    class="flex items-center gap-3 p-4 bg-white/5 hover:bg-white/10 rounded-lg transition border border-white/10 cursor-pointer">
                     <div class="w-10 h-10 bg-blue-500/20 rounded-lg flex items-center justify-center">
                         <i class="fas fa-book text-blue-400"></i>
                     </div>
@@ -206,8 +206,8 @@ DASHBOARD_TEMPLATE = """
                     </div>
                 </a>
                 
-                <a href="http://localhost:8000/health" target="_blank"
-                    class="flex items-center gap-3 p-4 bg-white/5 hover:bg-white/10 rounded-lg transition border border-white/10">
+                <a href="#" onclick="window.open(window.location.protocol + '//' + window.location.hostname + ':8000/health', '_blank'); return false;"
+                    class="flex items-center gap-3 p-4 bg-white/5 hover:bg-white/10 rounded-lg transition border border-white/10 cursor-pointer">
                     <div class="w-10 h-10 bg-green-500/20 rounded-lg flex items-center justify-center">
                         <i class="fas fa-heartbeat text-green-400"></i>
                     </div>
