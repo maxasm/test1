@@ -322,36 +322,68 @@ def _format_history(messages: list[dict]) -> str:
     return "\n".join(parts).strip()
 
 
-def add_conversation_context(app, store: ConversationStore):
-    history_limit = int(get_env("CONVERSATION_HISTORY_LIMIT", "12"))
-    max_assistant_chars = int(get_env("CONVERSATION_ASSISTANT_MAX_CHARS", "20000"))
+class ConversationContextMiddleware:
+    """
+    Pure ASGI middleware for conversation context injection.
+    Avoids BaseHTTPMiddleware issues with body consumption and streaming.
+    """
 
-    @app.on_event("startup")
-    async def _startup_migrate():
-        store.migrate()
+    def __init__(self, app, store: ConversationStore, history_limit: int, max_assistant_chars: int):
+        self.app = app
+        self.store = store
+        self.history_limit = history_limit
+        self.max_assistant_chars = max_assistant_chars
 
-    @app.middleware("http")
-    async def _conversation_context_middleware(request: Request, call_next):
-        if request.method.upper() != "POST" or request.url.path != "/api/vanna/v2/chat_sse":
-            return await call_next(request)
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
 
-        user_id, conversation_id = _extract_user_and_conversation_from_request(request)
+        method = scope.get("method", "").upper()
+        path = scope.get("path", "")
 
-        raw_body = await request.body()
+        if method != "POST" or path != "/api/vanna/v2/chat_sse":
+            await self.app(scope, receive, send)
+            return
+
+        headers = dict(scope.get("headers", []))
+        user_id = headers.get(b"x-user-id", b"").decode("utf-8") or "anonymous"
+        conversation_id = headers.get(b"x-conversation-id", b"").decode("utf-8") or "default"
+
+        body_parts = []
+        while True:
+            message = await receive()
+            body_parts.append(message.get("body", b""))
+            if not message.get("more_body", False):
+                break
+
+        raw_body = b"".join(body_parts)
+
         try:
             payload = json.loads(raw_body.decode("utf-8")) if raw_body else {}
         except Exception:
             payload = {}
 
-        message = payload.get("message") if isinstance(payload, dict) else None
-        if isinstance(message, str) and message.strip():
+        original_message = payload.get("message") if isinstance(payload, dict) else None
+        new_body = raw_body
+
+        if isinstance(original_message, str) and original_message.strip():
             try:
-                store.append_message(user_id=user_id, conversation_id=conversation_id, role="user", content=message)
+                self.store.append_message(
+                    user_id=user_id,
+                    conversation_id=conversation_id,
+                    role="user",
+                    content=original_message,
+                )
             except Exception as e:
                 logger.error("conversation_store_append_user_failed", error=str(e))
 
             try:
-                recent = store.get_recent_messages(user_id=user_id, conversation_id=conversation_id, limit=history_limit)
+                recent = self.store.get_recent_messages(
+                    user_id=user_id,
+                    conversation_id=conversation_id,
+                    limit=self.history_limit,
+                )
             except Exception as e:
                 logger.error("conversation_store_read_failed", error=str(e))
                 recent = []
@@ -362,83 +394,96 @@ def add_conversation_context(app, store: ConversationStore):
                     "You are continuing an ongoing conversation. Use the prior messages as context.\n\n"
                     + history_text
                     + "\n\nCurrent user message: "
-                    + message
+                    + original_message
                 )
+                new_body = json.dumps(payload).encode("utf-8")
 
-            new_body = json.dumps(payload).encode("utf-8")
+        body_sent = False
 
-            async def receive():
+        async def wrapped_receive():
+            nonlocal body_sent
+            if not body_sent:
+                body_sent = True
                 return {"type": "http.request", "body": new_body, "more_body": False}
+            while True:
+                msg = await receive()
+                if msg["type"] == "http.disconnect":
+                    return msg
 
-            request._receive = receive
-
-        response = await call_next(request)
-
-        if not isinstance(response, StreamingResponse):
-            return response
-
-        original_iterator = response.body_iterator
         assistant_text_parts: list[str] = []
-        event_buffer = b""
 
-        async def wrapped_iterator():
-            nonlocal event_buffer
-            try:
-                async for chunk in original_iterator:
-                    if isinstance(chunk, str):
-                        chunk_bytes = chunk.encode("utf-8")
-                    else:
-                        chunk_bytes = chunk
+        async def wrapped_send(message):
+            if message["type"] == "http.response.start":
+                await send(message)
+                return
 
-                    event_buffer += chunk_bytes
-                    while b"\n\n" in event_buffer:
-                        event_blob, event_buffer = event_buffer.split(b"\n\n", 1)
-                        for line in event_blob.split(b"\n"):
-                            if not line.startswith(b"data:"):
-                                continue
-                            data = line[5:].lstrip()
-                            if data == b"[DONE]" or not data:
-                                continue
-                            try:
-                                event = json.loads(data.decode("utf-8"))
-                            except Exception:
-                                continue
+            if message["type"] == "http.response.body":
+                body = message.get("body", b"")
 
-                            try:
-                                event_type = event.get("type") if isinstance(event, dict) else "unknown"
-                                store.append_event(
-                                    user_id=user_id,
-                                    conversation_id=conversation_id,
-                                    event_type=str(event_type) if event_type else "unknown",
-                                    event_json=event,
-                                )
-                            except Exception as e:
-                                logger.error("conversation_store_append_event_failed", error=str(e))
-
-                            if isinstance(event, dict) and event.get("type") == "text":
-                                content = event.get("content")
-                                if isinstance(content, str) and content:
-                                    assistant_text_parts.append(content)
-                                    joined_len = sum(len(p) for p in assistant_text_parts)
-                                    if joined_len > max_assistant_chars:
-                                        assistant_text_parts[:] = ["".join(assistant_text_parts)[-max_assistant_chars:]]
-
-                    yield chunk_bytes
-            finally:
-                assistant_text = "\n".join([p for p in assistant_text_parts if p]).strip()
-                if assistant_text:
+                if body:
                     try:
-                        store.append_message(
-                            user_id=user_id,
-                            conversation_id=conversation_id,
-                            role="assistant",
-                            content=assistant_text,
-                        )
-                    except Exception as e:
-                        logger.error("conversation_store_append_assistant_failed", error=str(e))
+                        text = body.decode("utf-8") if isinstance(body, bytes) else body
+                        for line in text.split("\n"):
+                            if line.startswith("data:"):
+                                data = line[5:].strip()
+                                if data and data != "[DONE]":
+                                    try:
+                                        event = json.loads(data)
+                                        try:
+                                            event_type = event.get("type") if isinstance(event, dict) else "unknown"
+                                            self.store.append_event(
+                                                user_id=user_id,
+                                                conversation_id=conversation_id,
+                                                event_type=str(event_type) if event_type else "unknown",
+                                                event_json=event,
+                                            )
+                                        except Exception as e:
+                                            logger.error("conversation_store_append_event_failed", error=str(e))
 
-        response.body_iterator = wrapped_iterator()
-        return response
+                                        if isinstance(event, dict) and event.get("type") == "text":
+                                            content = event.get("content")
+                                            if isinstance(content, str) and content:
+                                                assistant_text_parts.append(content)
+                                    except json.JSONDecodeError:
+                                        pass
+                    except Exception:
+                        pass
+
+                await send(message)
+
+                if not message.get("more_body", False):
+                    assistant_text = "\n".join([p for p in assistant_text_parts if p]).strip()
+                    if assistant_text:
+                        try:
+                            self.store.append_message(
+                                user_id=user_id,
+                                conversation_id=conversation_id,
+                                role="assistant",
+                                content=assistant_text,
+                            )
+                        except Exception as e:
+                            logger.error("conversation_store_append_assistant_failed", error=str(e))
+                return
+
+            await send(message)
+
+        await self.app(scope, wrapped_receive, wrapped_send)
+
+
+def add_conversation_context(app, store: ConversationStore):
+    history_limit = int(get_env("CONVERSATION_HISTORY_LIMIT", "12"))
+    max_assistant_chars = int(get_env("CONVERSATION_ASSISTANT_MAX_CHARS", "20000"))
+
+    @app.on_event("startup")
+    async def _startup_migrate():
+        store.migrate()
+
+    app.add_middleware(
+        ConversationContextMiddleware,
+        store=store,
+        history_limit=history_limit,
+        max_assistant_chars=max_assistant_chars,
+    )
 
     @app.get("/api/conversation/messages")
     async def get_conversation_messages(request: Request, limit: int = 50):
@@ -689,6 +734,7 @@ def main() -> None:
     # Create ASGI app and add custom training endpoints
     app = server.create_app()
     add_training_endpoints(app, agent)
+    add_chat_endpoint(app, agent)
     add_conversation_context(app, conversation_store)
     
     logger.info("server_starting", host=host, port=port)
@@ -696,6 +742,169 @@ def main() -> None:
     # Run the server with the app
     import uvicorn
     uvicorn.run(app, host=host, port=port)
+
+
+# -----------------------------------------------------------------------------
+# Synchronous Chat Endpoint (Direct OpenAI call, no streaming)
+# -----------------------------------------------------------------------------
+def add_chat_endpoint(app, agent: Agent):
+    """
+    Add a synchronous REST endpoint for chat that directly calls OpenAI.
+    No streaming, no SSE - just one request in, one response out.
+    """
+    from fastapi import HTTPException
+    from pydantic import BaseModel
+    import uuid
+    import openai
+    
+    # Get OpenAI config from environment
+    openai_api_key = get_required_env("OPENAI_API_KEY", ["OPENAI_API_PROJECT_KEY"])
+    openai_model = get_env("OPENAI_MODEL", "gpt-4")
+    
+    # Get MySQL config for running SQL
+    mysql_host = get_required_env("MYSQL_DO_HOST", ["MYSQL_HOST"])
+    mysql_port = int(get_env("MYSQL_DO_PORT", "3306", ["MYSQL_PORT"]))
+    mysql_user = get_required_env("MYSQL_DO_USER", ["MYSQL_USER"])
+    mysql_password = get_required_env("MYSQL_DO_PASSWORD", ["MYSQL_PASSWORD"])
+    mysql_database = get_required_env("MYSQL_DO_DATABASE", ["MYSQL_DATABASE"])
+    
+    # Create OpenAI client
+    client = openai.OpenAI(api_key=openai_api_key)
+    
+    class ChatRequest(BaseModel):
+        message: str
+        conversation_id: str | None = None
+        run_sql: bool = True  # Whether to execute generated SQL
+    
+    class ChatResponse(BaseModel):
+        response: str
+        conversation_id: str
+        request_id: str
+        sql: str | None = None
+        data: list | None = None
+        error: str | None = None
+    
+    def get_database_schema() -> str:
+        """Get database schema for context."""
+        try:
+            conn = pymysql.connect(
+                host=mysql_host,
+                port=mysql_port,
+                user=mysql_user,
+                password=mysql_password,
+                database=mysql_database,
+            )
+            cursor = conn.cursor()
+            cursor.execute("SHOW TABLES")
+            tables = [row[0] for row in cursor.fetchall()]
+            
+            schema_parts = []
+            for table in tables:
+                cursor.execute(f"DESCRIBE `{table}`")
+                columns = cursor.fetchall()
+                col_defs = [f"  {col[0]} {col[1]}" for col in columns]
+                schema_parts.append(f"Table: {table}\n" + "\n".join(col_defs))
+            
+            conn.close()
+            return "\n\n".join(schema_parts)
+        except Exception as e:
+            logger.error("schema_fetch_failed", error=str(e))
+            return f"Error fetching schema: {str(e)}"
+    
+    def execute_sql(sql: str) -> tuple[list | None, str | None]:
+        """Execute SQL and return results or error."""
+        try:
+            conn = pymysql.connect(
+                host=mysql_host,
+                port=mysql_port,
+                user=mysql_user,
+                password=mysql_password,
+                database=mysql_database,
+                cursorclass=pymysql.cursors.DictCursor,
+            )
+            cursor = conn.cursor()
+            cursor.execute(sql)
+            results = cursor.fetchall()
+            conn.close()
+            return list(results), None
+        except Exception as e:
+            return None, str(e)
+    
+    @app.post("/api/chat", response_model=ChatResponse)
+    async def chat_sync(chat_request: ChatRequest):
+        """
+        Synchronous chat endpoint - directly calls OpenAI, no streaming.
+        
+        1. Gets database schema
+        2. Sends user question + schema to OpenAI
+        3. Extracts SQL from response
+        4. Optionally executes SQL
+        5. Returns complete response
+        """
+        try:
+            conversation_id = chat_request.conversation_id or f"conv_{uuid.uuid4().hex[:8]}"
+            request_id = str(uuid.uuid4())
+            
+            # Get database schema for context
+            schema = get_database_schema()
+            
+            # Build the prompt
+            system_prompt = f"""You are a helpful SQL assistant. You help users query a MySQL database.
+
+Here is the database schema:
+{schema}
+
+When the user asks a question:
+1. Understand what data they need
+2. Generate a valid MySQL query to get that data
+3. Always wrap your SQL in ```sql and ``` code blocks
+4. Explain what the query does
+
+Be concise and helpful."""
+
+            # Call OpenAI directly (no streaming)
+            response = client.chat.completions.create(
+                model=openai_model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": chat_request.message},
+                ],
+                temperature=0.1,
+            )
+            
+            ai_response = response.choices[0].message.content
+            
+            # Extract SQL from response
+            sql_query = None
+            data = None
+            sql_error = None
+            
+            if "```sql" in ai_response:
+                # Extract SQL between ```sql and ```
+                import re
+                sql_match = re.search(r"```sql\s*(.*?)\s*```", ai_response, re.DOTALL)
+                if sql_match:
+                    sql_query = sql_match.group(1).strip()
+                    
+                    # Execute SQL if requested
+                    if chat_request.run_sql and sql_query:
+                        data, sql_error = execute_sql(sql_query)
+                        if sql_error:
+                            ai_response += f"\n\n**SQL Execution Error:** {sql_error}"
+                        elif data:
+                            ai_response += f"\n\n**Query returned {len(data)} rows.**"
+            
+            return ChatResponse(
+                response=ai_response,
+                conversation_id=conversation_id,
+                request_id=request_id,
+                sql=sql_query,
+                data=data,
+                error=sql_error,
+            )
+        except Exception as e:
+            logger.error("chat_sync_failed", error=str(e))
+            raise HTTPException(status_code=500, detail=str(e))
 
 
 # -----------------------------------------------------------------------------
