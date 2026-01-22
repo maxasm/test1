@@ -237,6 +237,40 @@ class HttpChromaAgentMemory(ChromaAgentMemory):
             )
         return self._client
 
+    def _get_collection(self):
+        """Get or create the configured Chroma collection."""
+        if self._collection is None:
+            client = self._get_client()
+            self._collection = client.get_or_create_collection(
+                name=self.collection_name,
+            )
+        return self._collection
+
+    def raw_get(
+        self,
+        *,
+        limit: int = 100,
+        offset: int = 0,
+        where: dict | None = None,
+        where_document: dict | None = None,
+        include: list[str] | None = None,
+    ) -> dict:
+        collection = self._get_collection()
+        payload = {
+            "limit": limit,
+            "offset": offset,
+            "include": include or ["documents", "metadatas"],
+        }
+        if where is not None:
+            payload["where"] = where
+        if where_document is not None:
+            payload["where_document"] = where_document
+        return collection.get(**payload)
+
+    def raw_delete(self, *, ids: list[str]) -> None:
+        collection = self._get_collection()
+        collection.delete(ids=ids)
+
 
 # -----------------------------------------------------------------------------
 # Custom User Resolver for PHP Frontend Integration
@@ -500,6 +534,7 @@ Pass user identity via headers:
     ]
     
     add_training_endpoints(app, agent)
+    add_memory_admin_endpoints(app, agent)
     add_chat_endpoint(app, agent)
     add_chat_sse_endpoint(app)
     
@@ -797,6 +832,158 @@ Be concise and helpful."""
             )
         except Exception as e:
             logger.error("chat_sync_failed", error=str(e))
+            raise HTTPException(status_code=500, detail=str(e))
+
+
+# -----------------------------------------------------------------------------
+# Admin Memory Management Endpoints
+# -----------------------------------------------------------------------------
+def add_memory_admin_endpoints(app, agent: Agent):
+    from fastapi import HTTPException
+    from fastapi.responses import JSONResponse
+    from pydantic import BaseModel, Field
+    import uuid
+
+    class TextMemoryItem(BaseModel):
+        id: str
+        content: str
+        metadata: dict | None = None
+
+    class ListTextMemoriesResponse(BaseModel):
+        status: str
+        items: list[TextMemoryItem]
+
+    class CreateTextMemoryRequest(BaseModel):
+        content: str = Field(..., min_length=1)
+
+    class CreateGoldenQueryRequest(BaseModel):
+        question: str = Field(..., min_length=1)
+        sql: str = Field(..., min_length=1)
+
+    def _require_http_chroma_memory() -> HttpChromaAgentMemory:
+        mem = getattr(agent, "agent_memory", None)
+        if not isinstance(mem, HttpChromaAgentMemory):
+            raise HTTPException(
+                status_code=500,
+                detail="Agent memory is not HttpChromaAgentMemory; cannot manage raw Chroma collection.",
+            )
+        return mem
+
+    @app.get("/api/admin/memory/text", response_model=ListTextMemoriesResponse, tags=["Training"])
+    async def list_text_memories(limit: int = 100, offset: int = 0):
+        try:
+            mem = _require_http_chroma_memory()
+            data = mem.raw_get(limit=limit, offset=offset)
+            ids = data.get("ids") or []
+            docs = data.get("documents") or []
+            metas = data.get("metadatas") or []
+            items = []
+            for i in range(min(len(ids), len(docs))):
+                items.append({"id": ids[i], "content": docs[i] or "", "metadata": (metas[i] if i < len(metas) else None)})
+            return JSONResponse({"status": "success", "items": items})
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error("admin_list_text_memories_failed", error=str(e))
+            raise HTTPException(status_code=500, detail=str(e))
+
+    @app.post("/api/admin/memory/text", tags=["Training"])
+    async def create_text_memory(payload: CreateTextMemoryRequest):
+        try:
+            from vanna.core.tool import ToolContext
+            from vanna.core.user import User
+
+            admin_user = User(
+                id="dashboard@admin",
+                email="dashboard@admin",
+                group_memberships=["admin"],
+                metadata={},
+            )
+            context = ToolContext(
+                user=admin_user,
+                agent=agent,
+                agent_memory=agent.agent_memory,
+                conversation_id="dashboard-admin",
+                request_id=str(uuid.uuid4()),
+            )
+
+            await agent.agent_memory.save_text_memory(content=payload.content, context=context)
+            return JSONResponse({"status": "success"})
+        except Exception as e:
+            logger.error("admin_create_text_memory_failed", error=str(e))
+            raise HTTPException(status_code=500, detail=str(e))
+
+    @app.delete("/api/admin/memory/text/{memory_id}", tags=["Training"])
+    async def delete_text_memory(memory_id: str):
+        try:
+            mem = _require_http_chroma_memory()
+            mem.raw_delete(ids=[memory_id])
+            return JSONResponse({"status": "success"})
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error("admin_delete_text_memory_failed", error=str(e))
+            raise HTTPException(status_code=500, detail=str(e))
+
+    @app.get("/api/admin/golden_queries", response_model=ListTextMemoriesResponse, tags=["Training"])
+    async def list_golden_queries(limit: int = 100, offset: int = 0):
+        try:
+            mem = _require_http_chroma_memory()
+            data = mem.raw_get(
+                limit=limit,
+                offset=offset,
+                where_document={"$contains": "GOLDEN_QUERY\n"},
+            )
+            ids = data.get("ids") or []
+            docs = data.get("documents") or []
+            metas = data.get("metadatas") or []
+            items = []
+            for i in range(min(len(ids), len(docs))):
+                items.append({"id": ids[i], "content": docs[i] or "", "metadata": (metas[i] if i < len(metas) else None)})
+            return JSONResponse({"status": "success", "items": items})
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error("admin_list_golden_queries_failed", error=str(e))
+            raise HTTPException(status_code=500, detail=str(e))
+
+    @app.post("/api/admin/golden_queries", tags=["Training"])
+    async def create_golden_query(payload: CreateGoldenQueryRequest):
+        try:
+            from vanna.core.tool import ToolContext
+            from vanna.core.user import User
+
+            admin_user = User(
+                id="dashboard@admin",
+                email="dashboard@admin",
+                group_memberships=["admin"],
+                metadata={},
+            )
+            context = ToolContext(
+                user=admin_user,
+                agent=agent,
+                agent_memory=agent.agent_memory,
+                conversation_id="dashboard-admin",
+                request_id=str(uuid.uuid4()),
+            )
+
+            content = f"GOLDEN_QUERY\nQuestion: {payload.question}\nSQL: {payload.sql}"
+            await agent.agent_memory.save_text_memory(content=content, context=context)
+            return JSONResponse({"status": "success"})
+        except Exception as e:
+            logger.error("admin_create_golden_query_failed", error=str(e))
+            raise HTTPException(status_code=500, detail=str(e))
+
+    @app.delete("/api/admin/golden_queries/{memory_id}", tags=["Training"])
+    async def delete_golden_query(memory_id: str):
+        try:
+            mem = _require_http_chroma_memory()
+            mem.raw_delete(ids=[memory_id])
+            return JSONResponse({"status": "success"})
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error("admin_delete_golden_query_failed", error=str(e))
             raise HTTPException(status_code=500, detail=str(e))
 
 

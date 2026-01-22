@@ -7,6 +7,7 @@ import os
 from functools import wraps
 from dotenv import load_dotenv
 
+import httpx
 from flask import Flask, render_template_string, request, redirect, url_for, session, flash
 
 load_dotenv()
@@ -16,6 +17,8 @@ app.secret_key = os.urandom(24)
 
 DASHBOARD_PASSKEY = os.getenv("DASHBOARD_PASSKEY", "changeme")
 DASHBOARD_PORT = int(os.getenv("DASHBOARD_PORT", "8080"))
+
+VANNA_BASE_URL = os.getenv("VANNA_BASE_URL", "http://app:8000")
 
 # HTML Templates
 LOGIN_TEMPLATE = """
@@ -75,6 +78,207 @@ LOGIN_TEMPLATE = """
 </html>
 """
 
+MEMORIES_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Persistent Memories - Vanna AI Dashboard</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+</head>
+<body class="min-h-screen bg-gradient-to-br from-slate-900 via-purple-900 to-slate-900">
+    <nav class="bg-white/5 backdrop-blur-lg border-b border-white/10">
+        <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+            <div class="flex items-center justify-between h-16">
+                <div class="flex items-center gap-3">
+                    <div class="w-10 h-10 bg-gradient-to-br from-purple-500 to-pink-500 rounded-lg flex items-center justify-center">
+                        <i class="fas fa-robot text-white"></i>
+                    </div>
+                    <a class="text-white font-bold text-xl" href="{{ url_for('dashboard') }}">Vanna AI Dashboard</a>
+                </div>
+                <div class="flex items-center gap-2">
+                    <a href="{{ url_for('memories') }}"
+                        class="flex items-center gap-2 px-3 py-2 bg-white/20 text-white rounded-lg transition">
+                        <i class="fas fa-brain"></i>
+                        Memories
+                    </a>
+                    <a href="{{ url_for('golden_queries') }}"
+                        class="flex items-center gap-2 px-3 py-2 bg-white/10 hover:bg-white/20 text-white rounded-lg transition">
+                        <i class="fas fa-star"></i>
+                        Golden Queries
+                    </a>
+                    <a href="{{ url_for('logout') }}" 
+                        class="flex items-center gap-2 px-4 py-2 bg-white/10 hover:bg-white/20 text-white rounded-lg transition">
+                        <i class="fas fa-sign-out-alt"></i>
+                        Logout
+                    </a>
+                </div>
+            </div>
+        </div>
+    </nav>
+
+    <main class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
+        <div class="mb-8">
+            <h1 class="text-3xl font-bold text-white mb-2">Persistent Agent Memory</h1>
+            <p class="text-gray-400">Manage text memories stored in ChromaDB</p>
+        </div>
+
+        {% with messages = get_flashed_messages(with_categories=true) %}
+            {% if messages %}
+                {% for category, message in messages %}
+                    <div class="mb-4 p-3 rounded-lg {% if category == 'error' %}bg-red-500/20 text-red-300 border border-red-500/30{% else %}bg-green-500/20 text-green-300 border border-green-500/30{% endif %}">
+                        {{ message }}
+                    </div>
+                {% endfor %}
+            {% endif %}
+        {% endwith %}
+
+        <div class="bg-white/10 backdrop-blur-lg rounded-xl p-6 border border-white/10 mb-8">
+            <h2 class="text-xl font-bold text-white mb-4">Add Memory</h2>
+            <form method="POST" action="{{ url_for('memories_create') }}" class="space-y-4">
+                <textarea name="content" required rows="5"
+                    class="w-full px-4 py-3 bg-white/5 border border-white/10 rounded-lg text-white placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-purple-500 focus:border-transparent transition"
+                    placeholder="Add a note, schema hint, business rule, etc..."></textarea>
+                <button type="submit"
+                    class="py-2 px-4 bg-gradient-to-r from-purple-600 to-pink-600 hover:from-purple-700 hover:to-pink-700 text-white font-semibold rounded-lg shadow-lg hover:shadow-xl transition-all duration-200">
+                    Save Memory
+                </button>
+            </form>
+        </div>
+
+        <div class="bg-white/10 backdrop-blur-lg rounded-xl p-6 border border-white/10">
+            <div class="flex items-center justify-between mb-4">
+                <h2 class="text-xl font-bold text-white">Recent Memories</h2>
+                <a href="{{ url_for('memories') }}" class="text-purple-300 hover:text-purple-200 text-sm">Refresh</a>
+            </div>
+            <div class="space-y-4">
+                {% for item in items %}
+                    <div class="bg-white/5 rounded-lg border border-white/10 p-4">
+                        <div class="flex items-start justify-between gap-4">
+                            <div class="min-w-0">
+                                <div class="text-gray-400 text-xs break-all">{{ item.id }}</div>
+                                <pre class="text-white whitespace-pre-wrap break-words mt-2 text-sm">{{ item.content }}</pre>
+                            </div>
+                            <form method="POST" action="{{ url_for('memories_delete', memory_id=item.id) }}" onsubmit="return confirm('Delete this memory?');">
+                                <button type="submit" class="text-red-300 hover:text-red-200 text-sm">Delete</button>
+                            </form>
+                        </div>
+                    </div>
+                {% endfor %}
+                {% if not items %}
+                    <div class="text-gray-400">No memories found.</div>
+                {% endif %}
+            </div>
+        </div>
+    </main>
+</body>
+</html>
+"""
+
+GOLDEN_QUERIES_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Golden Queries - Vanna AI Dashboard</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+</head>
+<body class="min-h-screen bg-gradient-to-br from-slate-900 via-purple-900 to-slate-900">
+    <nav class="bg-white/5 backdrop-blur-lg border-b border-white/10">
+        <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+            <div class="flex items-center justify-between h-16">
+                <div class="flex items-center gap-3">
+                    <div class="w-10 h-10 bg-gradient-to-br from-purple-500 to-pink-500 rounded-lg flex items-center justify-center">
+                        <i class="fas fa-robot text-white"></i>
+                    </div>
+                    <a class="text-white font-bold text-xl" href="{{ url_for('dashboard') }}">Vanna AI Dashboard</a>
+                </div>
+                <div class="flex items-center gap-2">
+                    <a href="{{ url_for('memories') }}"
+                        class="flex items-center gap-2 px-3 py-2 bg-white/10 hover:bg-white/20 text-white rounded-lg transition">
+                        <i class="fas fa-brain"></i>
+                        Memories
+                    </a>
+                    <a href="{{ url_for('golden_queries') }}"
+                        class="flex items-center gap-2 px-3 py-2 bg-white/20 text-white rounded-lg transition">
+                        <i class="fas fa-star"></i>
+                        Golden Queries
+                    </a>
+                    <a href="{{ url_for('logout') }}" 
+                        class="flex items-center gap-2 px-4 py-2 bg-white/10 hover:bg-white/20 text-white rounded-lg transition">
+                        <i class="fas fa-sign-out-alt"></i>
+                        Logout
+                    </a>
+                </div>
+            </div>
+        </div>
+    </nav>
+
+    <main class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
+        <div class="mb-8">
+            <h1 class="text-3xl font-bold text-white mb-2">Golden Queries</h1>
+            <p class="text-gray-400">Store canonical question + SQL pairs as text memories</p>
+        </div>
+
+        {% with messages = get_flashed_messages(with_categories=true) %}
+            {% if messages %}
+                {% for category, message in messages %}
+                    <div class="mb-4 p-3 rounded-lg {% if category == 'error' %}bg-red-500/20 text-red-300 border border-red-500/30{% else %}bg-green-500/20 text-green-300 border border-green-500/30{% endif %}">
+                        {{ message }}
+                    </div>
+                {% endfor %}
+            {% endif %}
+        {% endwith %}
+
+        <div class="bg-white/10 backdrop-blur-lg rounded-xl p-6 border border-white/10 mb-8">
+            <h2 class="text-xl font-bold text-white mb-4">Add Golden Query</h2>
+            <form method="POST" action="{{ url_for('golden_queries_create') }}" class="space-y-4">
+                <input name="question" required
+                    class="w-full px-4 py-3 bg-white/5 border border-white/10 rounded-lg text-white placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-purple-500 focus:border-transparent transition"
+                    placeholder="Question (e.g. Top 5 products by revenue)">
+                <textarea name="sql" required rows="6"
+                    class="w-full px-4 py-3 bg-white/5 border border-white/10 rounded-lg text-white placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-purple-500 focus:border-transparent transition"
+                    placeholder="SQL (MySQL)"></textarea>
+                <button type="submit"
+                    class="py-2 px-4 bg-gradient-to-r from-purple-600 to-pink-600 hover:from-purple-700 hover:to-pink-700 text-white font-semibold rounded-lg shadow-lg hover:shadow-xl transition-all duration-200">
+                    Save Golden Query
+                </button>
+            </form>
+        </div>
+
+        <div class="bg-white/10 backdrop-blur-lg rounded-xl p-6 border border-white/10">
+            <div class="flex items-center justify-between mb-4">
+                <h2 class="text-xl font-bold text-white">Stored Golden Queries</h2>
+                <a href="{{ url_for('golden_queries') }}" class="text-purple-300 hover:text-purple-200 text-sm">Refresh</a>
+            </div>
+            <div class="space-y-4">
+                {% for item in items %}
+                    <div class="bg-white/5 rounded-lg border border-white/10 p-4">
+                        <div class="flex items-start justify-between gap-4">
+                            <div class="min-w-0">
+                                <div class="text-gray-400 text-xs break-all">{{ item.id }}</div>
+                                <pre class="text-white whitespace-pre-wrap break-words mt-2 text-sm">{{ item.content }}</pre>
+                            </div>
+                            <form method="POST" action="{{ url_for('golden_queries_delete', memory_id=item.id) }}" onsubmit="return confirm('Delete this golden query?');">
+                                <button type="submit" class="text-red-300 hover:text-red-200 text-sm">Delete</button>
+                            </form>
+                        </div>
+                    </div>
+                {% endfor %}
+                {% if not items %}
+                    <div class="text-gray-400">No golden queries found.</div>
+                {% endif %}
+            </div>
+        </div>
+    </main>
+</body>
+</html>
+"""
+
 DASHBOARD_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="en">
@@ -96,11 +300,23 @@ DASHBOARD_TEMPLATE = """
                     </div>
                     <span class="text-white font-bold text-xl">Vanna AI Dashboard</span>
                 </div>
-                <a href="{{ url_for('logout') }}" 
-                    class="flex items-center gap-2 px-4 py-2 bg-white/10 hover:bg-white/20 text-white rounded-lg transition">
-                    <i class="fas fa-sign-out-alt"></i>
-                    Logout
-                </a>
+                <div class="flex items-center gap-2">
+                    <a href="{{ url_for('memories') }}"
+                        class="flex items-center gap-2 px-3 py-2 bg-white/10 hover:bg-white/20 text-white rounded-lg transition">
+                        <i class="fas fa-brain"></i>
+                        Memories
+                    </a>
+                    <a href="{{ url_for('golden_queries') }}"
+                        class="flex items-center gap-2 px-3 py-2 bg-white/10 hover:bg-white/20 text-white rounded-lg transition">
+                        <i class="fas fa-star"></i>
+                        Golden Queries
+                    </a>
+                    <a href="{{ url_for('logout') }}" 
+                        class="flex items-center gap-2 px-4 py-2 bg-white/10 hover:bg-white/20 text-white rounded-lg transition">
+                        <i class="fas fa-sign-out-alt"></i>
+                        Logout
+                    </a>
+                </div>
             </div>
         </div>
     </nav>
@@ -313,6 +529,101 @@ def dashboard():
         chroma_collection=os.getenv('CHROMA_COLLECTION_NAME', 'vanna_memories'),
         embedding_model=os.getenv('OPENAI_EMBEDDING_MODEL', 'text-embedding-3-small'),
     )
+
+
+def _api_get(path: str, params: dict | None = None) -> dict:
+    url = f"{VANNA_BASE_URL}{path}"
+    with httpx.Client(timeout=10.0) as client:
+        r = client.get(url, params=params)
+        r.raise_for_status()
+        return r.json()
+
+
+def _api_post(path: str, json_body: dict) -> dict:
+    url = f"{VANNA_BASE_URL}{path}"
+    with httpx.Client(timeout=10.0) as client:
+        r = client.post(url, json=json_body)
+        r.raise_for_status()
+        return r.json() if r.text else {"status": "success"}
+
+
+def _api_delete(path: str) -> dict:
+    url = f"{VANNA_BASE_URL}{path}"
+    with httpx.Client(timeout=10.0) as client:
+        r = client.delete(url)
+        r.raise_for_status()
+        return r.json() if r.text else {"status": "success"}
+
+
+@app.route('/memories')
+@require_auth
+def memories():
+    try:
+        data = _api_get('/api/admin/memory/text', params={'limit': 100, 'offset': 0})
+        items = data.get('items', [])
+        return render_template_string(MEMORIES_TEMPLATE, items=items)
+    except Exception as e:
+        flash(f"Failed to load memories: {e}", 'error')
+        return render_template_string(MEMORIES_TEMPLATE, items=[])
+
+
+@app.route('/memories/create', methods=['POST'])
+@require_auth
+def memories_create():
+    content = request.form.get('content', '')
+    try:
+        _api_post('/api/admin/memory/text', {'content': content})
+        flash('Memory saved.', 'success')
+    except Exception as e:
+        flash(f"Failed to save memory: {e}", 'error')
+    return redirect(url_for('memories'))
+
+
+@app.route('/memories/delete/<memory_id>', methods=['POST'])
+@require_auth
+def memories_delete(memory_id: str):
+    try:
+        _api_delete(f'/api/admin/memory/text/{memory_id}')
+        flash('Memory deleted.', 'success')
+    except Exception as e:
+        flash(f"Failed to delete memory: {e}", 'error')
+    return redirect(url_for('memories'))
+
+
+@app.route('/golden-queries')
+@require_auth
+def golden_queries():
+    try:
+        data = _api_get('/api/admin/golden_queries', params={'limit': 100, 'offset': 0})
+        items = data.get('items', [])
+        return render_template_string(GOLDEN_QUERIES_TEMPLATE, items=items)
+    except Exception as e:
+        flash(f"Failed to load golden queries: {e}", 'error')
+        return render_template_string(GOLDEN_QUERIES_TEMPLATE, items=[])
+
+
+@app.route('/golden-queries/create', methods=['POST'])
+@require_auth
+def golden_queries_create():
+    question = request.form.get('question', '')
+    sql = request.form.get('sql', '')
+    try:
+        _api_post('/api/admin/golden_queries', {'question': question, 'sql': sql})
+        flash('Golden query saved.', 'success')
+    except Exception as e:
+        flash(f"Failed to save golden query: {e}", 'error')
+    return redirect(url_for('golden_queries'))
+
+
+@app.route('/golden-queries/delete/<memory_id>', methods=['POST'])
+@require_auth
+def golden_queries_delete(memory_id: str):
+    try:
+        _api_delete(f'/api/admin/golden_queries/{memory_id}')
+        flash('Golden query deleted.', 'success')
+    except Exception as e:
+        flash(f"Failed to delete golden query: {e}", 'error')
+    return redirect(url_for('golden_queries'))
 
 
 @app.route('/health')
