@@ -70,7 +70,7 @@ logger = structlog.get_logger()
 # -----------------------------------------------------------------------------
 # Vanna AI 2.0 Imports (official framework)
 # -----------------------------------------------------------------------------
-from vanna import Agent
+from vanna import Agent, AgentConfig
 from vanna.core.registry import ToolRegistry
 from vanna.core.user import UserResolver, User, RequestContext
 from vanna.tools import RunSqlTool, VisualizeDataTool
@@ -260,19 +260,34 @@ class HttpChromaAgentMemory(ChromaAgentMemory):
     def _get_client(self):
         """Get or create ChromaDB HTTP client for remote server."""
         if self._client is None:
+            logger.info(
+                "chromadb_client_creating",
+                host=self.host,
+                port=self.port,
+                collection_name=self.collection_name,
+            )
             self._client = chromadb.HttpClient(
                 host=self.host,
                 port=self.port,
                 settings=Settings(anonymized_telemetry=False),
             )
+            logger.info("chromadb_client_created")
         return self._client
 
     def _get_collection(self):
         """Get or create the configured Chroma collection."""
         if self._collection is None:
             client = self._get_client()
+            logger.info(
+                "chromadb_collection_get_or_create",
+                collection_name=self.collection_name,
+            )
             self._collection = client.get_or_create_collection(
                 name=self.collection_name,
+            )
+            logger.info(
+                "chromadb_collection_ready",
+                collection_name=self.collection_name,
             )
         return self._collection
 
@@ -285,6 +300,14 @@ class HttpChromaAgentMemory(ChromaAgentMemory):
         where_document: dict | None = None,
         include: list[str] | None = None,
     ) -> dict:
+        logger.debug(
+            "chromadb_raw_get",
+            limit=limit,
+            offset=offset,
+            where=where,
+            where_document=where_document,
+            include=include,
+        )
         collection = self._get_collection()
         payload = {
             "limit": limit,
@@ -295,11 +318,19 @@ class HttpChromaAgentMemory(ChromaAgentMemory):
             payload["where"] = where
         if where_document is not None:
             payload["where_document"] = where_document
-        return collection.get(**payload)
+        
+        result = collection.get(**payload)
+        logger.debug(
+            "chromadb_raw_get_result",
+            result_count=len(result.get("ids", [])),
+        )
+        return result
 
     def raw_delete(self, *, ids: list[str]) -> None:
+        logger.info("chromadb_raw_delete", ids=ids)
         collection = self._get_collection()
         collection.delete(ids=ids)
+        logger.debug("chromadb_raw_delete_completed", ids_count=len(ids))
 
 
 # -----------------------------------------------------------------------------
@@ -463,17 +494,25 @@ class SafeRunSqlTool(RunSqlTool):
     ALLOWED_TABLES = _csv_to_set(os.getenv("AI_ALLOWED_TABLES", ""))
 
     def run(self, sql: str, user=None):
-        logger.warning("SAFE run() HIT user=%r sql=%r", getattr(user, "id", None), (sql or "")[:200])
+        user_id = getattr(user, "id", None) if user else None
+        logger.info(
+            "safe_sql_tool_execution_started",
+            user_id=user_id,
+            sql_preview=(sql or "")[:200],
+            sql_length=len(sql or ""),
+        )
 
         s = (sql or "").strip()
         s_low = s.lower()
 
         # single statement only
         if ";" in s_low.rstrip(";"):
+            logger.warning("safe_sql_tool_rejected_multiple_statements", user_id=user_id)
             raise ValueError("Multiple statements are not allowed.")
 
         # only SELECT/WITH
         if not (s_low.startswith("select") or s_low.startswith("with")):
+            logger.warning("safe_sql_tool_rejected_non_select", user_id=user_id, sql_type=s_low.split()[0] if s_low else "empty")
             raise ValueError("Only SELECT/WITH queries are allowed.")
 
         # Check for allowed tables if configured
@@ -485,32 +524,80 @@ class SafeRunSqlTool(RunSqlTool):
                     break
             if not table_found:
                 allowed_list = ", ".join(sorted(self.ALLOWED_TABLES))
+                logger.warning(
+                    "safe_sql_tool_rejected_table_not_allowed",
+                    user_id=user_id,
+                    allowed_tables=list(self.ALLOWED_TABLES),
+                )
                 raise ValueError(f"Query must use one of the allowed tables/views: {allowed_list}")
 
         # no SELECT *
         if re.search(r"\bselect\s+\*\b", s_low):
+            logger.warning("safe_sql_tool_rejected_select_star", user_id=user_id)
             raise ValueError("SELECT * is not allowed.")
 
         # blocked relations (optional)
         for rel in self.BLOCKED_RELATIONS:
             if re.search(rf"\b{re.escape(rel)}\b", s_low):
+                logger.warning(
+                    "safe_sql_tool_rejected_blocked_relation",
+                    user_id=user_id,
+                    blocked_relation=rel,
+                )
                 raise ValueError(f"Relation '{rel}' is not allowed.")
 
         # blocked columns (optional)
         for col in self.BLOCKED_COLS:
             if re.search(rf"\b{re.escape(col)}\b", s_low):
+                logger.warning(
+                    "safe_sql_tool_rejected_blocked_column",
+                    user_id=user_id,
+                    blocked_column=col,
+                )
                 raise ValueError(f"Column '{col}' is not allowed.")
 
         # enforce LIMIT (and cap)
         m = re.search(r"\blimit\s+(\d+)\b", s_low)
         if not m:
             s = s.rstrip() + f" LIMIT {self.DEFAULT_LIMIT}"
+            logger.debug(
+                "safe_sql_tool_added_limit",
+                user_id=user_id,
+                added_limit=self.DEFAULT_LIMIT,
+            )
         else:
             lim = int(m.group(1))
             if lim > self.MAX_LIMIT:
                 s = re.sub(r"(?i)\blimit\s+\d+\b", f"LIMIT {self.MAX_LIMIT}", s, count=1)
+                logger.debug(
+                    "safe_sql_tool_capped_limit",
+                    user_id=user_id,
+                    original_limit=lim,
+                    capped_limit=self.MAX_LIMIT,
+                )
 
-        return super().run(s, user=user)
+        logger.debug(
+            "safe_sql_tool_passing_to_parent",
+            user_id=user_id,
+            final_sql_preview=s[:200],
+        )
+        
+        try:
+            result = super().run(s, user=user)
+            logger.info(
+                "safe_sql_tool_execution_success",
+                user_id=user_id,
+                result_row_count=len(result) if result else 0,
+            )
+            return result
+        except Exception as e:
+            logger.error(
+                "safe_sql_tool_execution_failed",
+                user_id=user_id,
+                error=str(e),
+                error_type=type(e).__name__,
+            )
+            raise
 
 
 # -----------------------------------------------------------------------------
@@ -700,12 +787,18 @@ def create_vanna_agent() -> Agent:
     openai_api_key = get_required_env("OPENAI_API_KEY", ["OPENAI_API_PROJECT_KEY"])
     openai_model = get_env("OPENAI_MODEL", "gpt-4")
     
-    logger.info("configuring_llm", model=openai_model)
+    logger.info(
+        "configuring_llm",
+        model=openai_model,
+        api_key_configured=bool(openai_api_key and len(openai_api_key) > 10),
+    )
     
     llm = OpenAILlmService(
         api_key=openai_api_key,
         model=openai_model,
     )
+    
+    logger.debug("llm_service_created", llm_service_type=type(llm).__name__)
     
     # 2. Configure MySQL Database Runner
     mysql_host = get_required_env("MYSQL_DO_HOST", ["MYSQL_HOST"])
@@ -1148,8 +1241,22 @@ def add_chat_endpoint(app, agent: Agent):
             conversation_id = chat_request.conversation_id or f"conv_{uuid.uuid4().hex[:8]}"
             request_id = str(uuid.uuid4())
             
+            logger.info(
+                "chat_sync_request_received",
+                conversation_id=conversation_id,
+                request_id=request_id,
+                message_preview=chat_request.message[:100],
+                run_sql=chat_request.run_sql,
+            )
+            
             # Get database schema for context
             schema = get_database_schema()
+            
+            logger.debug(
+                "database_schema_retrieved",
+                schema_length=len(schema),
+                has_tables="Table:" in schema,
+            )
             
             # Build the prompt
             system_prompt = f"""You are a helpful SQL assistant. You help users query a MySQL database.
