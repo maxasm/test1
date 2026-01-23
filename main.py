@@ -1051,57 +1051,17 @@ Pass user identity via headers:
 
 
 # -----------------------------------------------------------------------------
-# Synchronous Chat Endpoint (Direct OpenAI call, no streaming)
+# Synchronous Chat Endpoint (Proper Vanna Agent Architecture)
 # -----------------------------------------------------------------------------
 def add_chat_endpoint(app, agent: Agent):
     """
-    Add a synchronous REST endpoint for chat that directly calls OpenAI.
+    Add a synchronous REST endpoint for chat that uses Vanna Agent architecture.
     No streaming, no SSE - just one request in, one response out.
     """
     from fastapi import HTTPException
     from pydantic import BaseModel, Field
     import uuid
-    import openai
-    
-    # Get OpenAI config from environment
-    openai_api_key = get_required_env("OPENAI_API_KEY", ["OPENAI_API_PROJECT_KEY"])
-    openai_model = get_env("OPENAI_MODEL", "gpt-4")
-    
-    # Get MySQL config for running SQL
-    mysql_host = get_required_env("MYSQL_DO_HOST", ["MYSQL_HOST"])
-    mysql_port = int(get_env("MYSQL_DO_PORT", "3306", ["MYSQL_PORT"]))
-    mysql_user = get_required_env("MYSQL_DO_USER", ["MYSQL_USER"])
-    mysql_password = get_required_env("MYSQL_DO_PASSWORD", ["MYSQL_PASSWORD"])
-    mysql_database = get_required_env("MYSQL_DO_DATABASE", ["MYSQL_DATABASE"])
-    mysql_ssl_ca = os.getenv("MYSQL_DO_SSL_CA")
-    mysql_ssl_config = {"ca": mysql_ssl_ca} if mysql_ssl_ca else None
-    
-    # Create OpenAI client
-    client = openai.OpenAI(api_key=openai_api_key)
-
-    def normalize_generated_sql(sql: str) -> str:
-        """Normalize LLM-generated SQL to avoid placeholders and improve MySQL compatibility."""
-        if not sql:
-            return sql
-
-        normalized = sql.strip()
-        normalized = normalized.replace("your_database_name", mysql_database)
-        normalized = normalized.replace("<database_name>", mysql_database)
-        normalized = normalized.replace("database_name", mysql_database)
-
-        import re
-
-        normalized = re.sub(
-            r"(?is)^\\s*SHOW\\s+TABLES\\s+(IN|FROM)\\s+`?" + re.escape(mysql_database) + r"`?\\s*;?\\s*$",
-            "SHOW TABLES;",
-            normalized,
-        )
-        normalized = re.sub(
-            r"(?is)^\\s*SHOW\\s+TABLES\\s+(IN|FROM)\\s+`?your_database_name`?\\s*;?\\s*$",
-            "SHOW TABLES;",
-            normalized,
-        )
-        return normalized
+    from vanna.core.user import RequestContext
     
     class ChatRequest(BaseModel):
         """Request body for the chat endpoint."""
@@ -1146,82 +1106,6 @@ def add_chat_endpoint(app, agent: Agent):
             description="Error message if SQL execution failed"
         )
     
-    def get_database_schema() -> str:
-        """Get database schema for context."""
-        try:
-            conn = pymysql.connect(
-                host=mysql_host,
-                port=mysql_port,
-                user=mysql_user,
-                password=mysql_password,
-                database=mysql_database,
-                ssl=mysql_ssl_config,
-            )
-            cursor = conn.cursor()
-            cursor.execute("SHOW TABLES")
-            tables = [row[0] for row in cursor.fetchall()]
-            
-            schema_parts = []
-            for table in tables:
-                cursor.execute(f"DESCRIBE `{table}`")
-                columns = cursor.fetchall()
-                col_defs = [f"  {col[0]} {col[1]}" for col in columns]
-                schema_parts.append(f"Table: {table}\n" + "\n".join(col_defs))
-            
-            conn.close()
-            return "\n\n".join(schema_parts)
-        except Exception as e:
-            logger.error("schema_fetch_failed", error=str(e))
-            return f"Error fetching schema: {str(e)}"
-    
-    def execute_sql(sql: str) -> tuple[list | None, str | None]:
-        """Execute SQL and return results or error."""
-        try:
-            conn = pymysql.connect(
-                host=mysql_host,
-                port=mysql_port,
-                user=mysql_user,
-                password=mysql_password,
-                database=mysql_database,
-                ssl=mysql_ssl_config,
-                cursorclass=pymysql.cursors.DictCursor,
-            )
-            cursor = conn.cursor()
-            cursor.execute(sql)
-            results = cursor.fetchall()
-            conn.close()
-            return list(results), None
-        except Exception as e:
-            return None, str(e)
-
-    def normalize_generated_sql(sql: str) -> str:
-        """Normalize LLM-generated SQL to avoid placeholders and improve MySQL compatibility."""
-        if not sql:
-            return sql
-
-        normalized = sql.strip()
-        # Common placeholder patterns from LLMs
-        normalized = normalized.replace("your_database_name", mysql_database)
-        normalized = normalized.replace("<database_name>", mysql_database)
-        normalized = normalized.replace("database_name", mysql_database)
-
-        # In MySQL, SHOW TABLES; lists tables for the current database.
-        # Some models generate SHOW TABLES IN/FROM <db>; which can introduce placeholders.
-        import re
-
-        normalized = re.sub(
-            r"(?is)^\\s*SHOW\\s+TABLES\\s+(IN|FROM)\\s+`?" + re.escape(mysql_database) + r"`?\\s*;?\\s*$",
-            "SHOW TABLES;",
-            normalized,
-        )
-        normalized = re.sub(
-            r"(?is)^\\s*SHOW\\s+TABLES\\s+(IN|FROM)\\s+`?your_database_name`?\\s*;?\\s*$",
-            "SHOW TABLES;",
-            normalized,
-        )
-
-        return normalized
-    
     @app.post("/api/chat", response_model=ChatResponse, tags=["Chat"])
     async def chat_sync(chat_request: ChatRequest):
         """
@@ -1249,153 +1133,57 @@ def add_chat_endpoint(app, agent: Agent):
                 run_sql=chat_request.run_sql,
             )
             
-            # Get database schema for context
-            schema = get_database_schema()
-            
-            logger.debug(
-                "database_schema_retrieved",
-                schema_length=len(schema),
-                has_tables="Table:" in schema,
+            # Create proper request context with user identity
+            request_context = RequestContext(
+                headers={
+                    "X-User-Id": "api-user",
+                    "X-Conversation-Id": conversation_id,
+                },
+                body={},
+                query_params={},
+                cookies={},
             )
             
-            # Build the prompt
-            system_prompt = f"""You are a helpful SQL assistant. You help users query a MySQL database.
-
-The current database name is: {mysql_database}
-
-Here is the database schema:
-{schema}
-
-When the user asks a question:
-1. Understand what data they need
-2. Generate a valid MySQL query to get that data
-3. Always wrap your SQL in ```sql and ``` code blocks
-4. Explain what the query does
-
-Important:
-- Do NOT use placeholders like 'your_database_name'.
-- Use the current database implicitly (e.g. use `SHOW TABLES;` instead of `SHOW TABLES IN ...`).
-
-Be concise and helpful."""
-
-            # Call OpenAI directly (no streaming)
-            response = client.chat.completions.create(
-                model=openai_model,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": chat_request.message},
-                ],
-                temperature=0.1,
+            # Let Vanna Agent handle everything
+            result = await agent.chat(
+                message=chat_request.message,
+                request_context=request_context,
             )
             
-            ai_response = response.choices[0].message.content
-            
-            # Extract SQL from response
+            # Extract SQL and data from result
             sql_query = None
             data = None
-            sql_error = None
+            error = None
             
-            if "```sql" in ai_response:
-                # Extract SQL between ```sql and ```
-                import re
-                sql_match = re.search(r"```sql\s*(.*?)\s*```", ai_response, re.DOTALL)
-                if sql_match:
-                    sql_query = normalize_generated_sql(sql_match.group(1).strip())
-                    
-                    # Execute SQL if requested using agent's tool registry
-                    if chat_request.run_sql and sql_query:
-                        try:
-                            # Get the SQL tool from agent's tool registry
-                            # First try to find SafeRunSqlTool, then RunSqlTool
-                            sql_tool = None
-                            tools = agent.tool_registry
-                            
-                            # Try different ways to access tools
-                            for attr in ["_tools", "tools", "_registered_tools", "registered_tools", "local_tools"]:
-                                if hasattr(tools, attr):
-                                    tool_dict = getattr(tools, attr)
-                                    if isinstance(tool_dict, dict):
-                                        for tool_name, tool in tool_dict.items():
-                                            if "SafeRunSqlTool" in str(type(tool)) or "RunSqlTool" in str(type(tool)):
-                                                sql_tool = tool
-                                                break
-                                    elif isinstance(tool_dict, list):
-                                        for tool in tool_dict:
-                                            if "SafeRunSqlTool" in str(type(tool)) or "RunSqlTool" in str(type(tool)):
-                                                sql_tool = tool
-                                                break
-                                if sql_tool:
-                                    break
-                            
-                            if sql_tool:
-                                # Create a user for the tool execution
-                                from vanna.core.user import User
-                                user = User(
-                                    id="api-chat-user",
-                                    email="api-chat@local",
-                                    group_memberships=["user"],
-                                    metadata={"conversation_id": conversation_id},
-                                )
-                                
-                                # Execute SQL using agent's tool
-                                data = sql_tool.run(sql_query, user=user)
-                                logger.info(
-                                    "sql_executed_via_agent_tool",
-                                    tool_type=type(sql_tool).__name__,
-                                    row_count=len(data) if data else 0,
-                                )
-                            else:
-                                # Fall back to manual execution if tool not found
-                                logger.warning("sql_tool_not_found_falling_back_to_manual")
-                                data, sql_error = execute_sql(sql_query)
-                                if sql_error:
-                                    ai_response += f"\n\n**SQL Execution Error:** {sql_error}"
-                        except Exception as e:
-                            logger.error("sql_execution_via_tool_failed", error=str(e))
-                            sql_error = str(e)
-                            ai_response += f"\n\n**SQL Execution Error:** {sql_error}"
-                        
-                        if not sql_error and data is not None:
-                            row_count = len(data)
-                            if row_count == 0:
-                                ai_response = "No results were found for your question."
-                            else:
-                                # Summarize the results in natural language so the user doesn't need to run SQL.
-                                # Keep the SQL in the dedicated response field.
-                                max_rows = 25
-                                preview_rows = (data or [])[:max_rows]
-                                summary_prompt = (
-                                    "You are a helpful data analyst. Answer the user's question using ONLY the SQL results provided. "
-                                    "Do not include SQL in your answer. If the results don't contain enough information, say so. "
-                                    "Be concise.\n\n"
-                                    f"User question: {chat_request.message}\n"
-                                    f"Row count: {row_count}\n"
-                                    f"Rows (up to {max_rows}): {json.dumps(preview_rows, ensure_ascii=False, cls=DatabaseJSONEncoder)}\n"
-                                )
-
-                                try:
-                                    summary = client.chat.completions.create(
-                                        model=openai_model,
-                                        messages=[
-                                            {"role": "system", "content": "Answer using the provided rows."},
-                                            {"role": "user", "content": summary_prompt},
-                                        ],
-                                        temperature=0.1,
-                                    )
-                                    summarized_text = summary.choices[0].message.content
-                                    if summarized_text and summarized_text.strip():
-                                        ai_response = summarized_text.strip()
-                                except Exception as e:
-                                    logger.error("chat_result_summarize_failed", error=str(e))
-                                    ai_response = f"Query returned {row_count} rows."
+            # The result should contain SQL and data if execution was successful
+            # Vanna's Agent.chat returns an object with response, sql, and data attributes
+            if hasattr(result, 'sql'):
+                sql_query = result.sql
+            if hasattr(result, 'data'):
+                data = result.data
+            if hasattr(result, 'error'):
+                error = result.error
+            
+            # If run_sql is False but we have SQL, we should still return it
+            # but not include data
+            if not chat_request.run_sql:
+                data = None
+                if sql_query:
+                    # Still include SQL in response but no data
+                    logger.info(
+                        "chat_sync_sql_not_executed",
+                        conversation_id=conversation_id,
+                        request_id=request_id,
+                        sql_preview=sql_query[:100] if sql_query else None,
+                    )
             
             return ChatResponse(
-                response=ai_response,
+                response=result.response if hasattr(result, 'response') else str(result),
                 conversation_id=conversation_id,
                 request_id=request_id,
                 sql=sql_query,
                 data=data,
-                error=sql_error,
+                error=error,
             )
         except Exception as e:
             logger.error("chat_sync_failed", error=str(e))
