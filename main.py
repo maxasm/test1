@@ -1302,13 +1302,61 @@ Be concise and helpful."""
                 if sql_match:
                     sql_query = normalize_generated_sql(sql_match.group(1).strip())
                     
-                    # Execute SQL if requested
+                    # Execute SQL if requested using agent's tool registry
                     if chat_request.run_sql and sql_query:
-                        data, sql_error = execute_sql(sql_query)
-                        if sql_error:
+                        try:
+                            # Get the SQL tool from agent's tool registry
+                            # First try to find SafeRunSqlTool, then RunSqlTool
+                            sql_tool = None
+                            tools = agent.tool_registry
+                            
+                            # Try different ways to access tools
+                            for attr in ["_tools", "tools", "_registered_tools", "registered_tools", "local_tools"]:
+                                if hasattr(tools, attr):
+                                    tool_dict = getattr(tools, attr)
+                                    if isinstance(tool_dict, dict):
+                                        for tool_name, tool in tool_dict.items():
+                                            if "SafeRunSqlTool" in str(type(tool)) or "RunSqlTool" in str(type(tool)):
+                                                sql_tool = tool
+                                                break
+                                    elif isinstance(tool_dict, list):
+                                        for tool in tool_dict:
+                                            if "SafeRunSqlTool" in str(type(tool)) or "RunSqlTool" in str(type(tool)):
+                                                sql_tool = tool
+                                                break
+                                if sql_tool:
+                                    break
+                            
+                            if sql_tool:
+                                # Create a user for the tool execution
+                                from vanna.core.user import User
+                                user = User(
+                                    id="api-chat-user",
+                                    email="api-chat@local",
+                                    group_memberships=["user"],
+                                    metadata={"conversation_id": conversation_id},
+                                )
+                                
+                                # Execute SQL using agent's tool
+                                data = sql_tool.run(sql_query, user=user)
+                                logger.info(
+                                    "sql_executed_via_agent_tool",
+                                    tool_type=type(sql_tool).__name__,
+                                    row_count=len(data) if data else 0,
+                                )
+                            else:
+                                # Fall back to manual execution if tool not found
+                                logger.warning("sql_tool_not_found_falling_back_to_manual")
+                                data, sql_error = execute_sql(sql_query)
+                                if sql_error:
+                                    ai_response += f"\n\n**SQL Execution Error:** {sql_error}"
+                        except Exception as e:
+                            logger.error("sql_execution_via_tool_failed", error=str(e))
+                            sql_error = str(e)
                             ai_response += f"\n\n**SQL Execution Error:** {sql_error}"
-                        else:
-                            row_count = len(data or [])
+                        
+                        if not sql_error and data is not None:
+                            row_count = len(data)
                             if row_count == 0:
                                 ai_response = "No results were found for your question."
                             else:
@@ -1510,359 +1558,18 @@ def add_memory_admin_endpoints(app, agent: Agent):
 # Streaming Chat Endpoint (SSE, UI-compatible)
 # -----------------------------------------------------------------------------
 def add_chat_sse_endpoint(app):
-    from fastapi import Request
-    from fastapi.responses import StreamingResponse
-    import uuid
-    import time
-    import datetime
-    import openai
-
-    # VannaFastAPIServer registers its own /api/vanna/v2/chat_sse route.
-    # FastAPI does not “override” earlier routes with the same path+method.
-    # Remove the existing route so our manual SSE implementation is used.
-    try:
-        to_keep = []
-        for r in list(getattr(app.router, "routes", [])):
-            path = getattr(r, "path", None)
-            methods = set(getattr(r, "methods", []) or [])
-            if path == "/api/vanna/v2/chat_sse" and "POST" in methods:
-                continue
-            to_keep.append(r)
-        app.router.routes = to_keep
-    except Exception as e:
-        logger.error("chat_sse_route_override_failed", error=str(e))
-
-    openai_api_key = get_required_env("OPENAI_API_KEY", ["OPENAI_API_PROJECT_KEY"])
-    openai_model = get_env("OPENAI_MODEL", "gpt-4")
-
-    mysql_host = get_required_env("MYSQL_DO_HOST", ["MYSQL_HOST"])
-    mysql_port = int(get_env("MYSQL_DO_PORT", "3306", ["MYSQL_PORT"]))
-    mysql_user = get_required_env("MYSQL_DO_USER", ["MYSQL_USER"])
-    mysql_password = get_required_env("MYSQL_DO_PASSWORD", ["MYSQL_PASSWORD"])
-    mysql_database = get_required_env("MYSQL_DO_DATABASE", ["MYSQL_DATABASE"])
-    mysql_ssl_ca = os.getenv("MYSQL_DO_SSL_CA")
-    mysql_ssl_config = {"ca": mysql_ssl_ca} if mysql_ssl_ca else None
-
-    client = openai.OpenAI(api_key=openai_api_key)
-
-    def normalize_generated_sql(sql: str) -> str:
-        """Normalize LLM-generated SQL to avoid placeholders and improve MySQL compatibility."""
-        if not sql:
-            return sql
-
-        normalized = sql.strip()
-        normalized = normalized.replace("your_database_name", mysql_database)
-        normalized = normalized.replace("<database_name>", mysql_database)
-        normalized = normalized.replace("database_name", mysql_database)
-
-        import re
-
-        normalized = re.sub(
-            r"(?is)^\\s*SHOW\\s+TABLES\\s+(IN|FROM)\\s+`?" + re.escape(mysql_database) + r"`?\\s*;?\\s*$",
-            "SHOW TABLES;",
-            normalized,
-        )
-        normalized = re.sub(
-            r"(?is)^\\s*SHOW\\s+TABLES\\s+(IN|FROM)\\s+`?your_database_name`?\\s*;?\\s*$",
-            "SHOW TABLES;",
-            normalized,
-        )
-
-        return normalized
-
-    def _now_iso() -> str:
-        return datetime.datetime.utcnow().replace(tzinfo=datetime.timezone.utc).isoformat()
-
-    def _sse_event(payload: dict) -> str:
-        return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
-
-    def _rich_base(*, event_id: str, event_type: str, data: dict):
-        return {
-            "id": event_id,
-            "type": event_type,
-            "lifecycle": "create",
-            "children": [],
-            "timestamp": _now_iso(),
-            "visible": True,
-            "interactive": False,
-            "data": data,
-        }
-
-    def _simple_text(text: str) -> dict:
-        return {"type": "text", "semantic_type": None, "metadata": None, "text": text}
-
-    def _execute_sql(sql: str) -> tuple[list | None, str | None]:
-        try:
-            conn = pymysql.connect(
-                host=mysql_host,
-                port=mysql_port,
-                user=mysql_user,
-                password=mysql_password,
-                database=mysql_database,
-                ssl=mysql_ssl_config,
-                cursorclass=pymysql.cursors.DictCursor,
-            )
-            cursor = conn.cursor()
-            cursor.execute(sql)
-            results = cursor.fetchall()
-            conn.close()
-            return list(results), None
-        except Exception as e:
-            return None, str(e)
-
-    def _get_database_schema() -> str:
-        try:
-            conn = pymysql.connect(
-                host=mysql_host,
-                port=mysql_port,
-                user=mysql_user,
-                password=mysql_password,
-                database=mysql_database,
-                ssl=mysql_ssl_config,
-            )
-            cursor = conn.cursor()
-            cursor.execute("SHOW TABLES")
-            tables = [row[0] for row in cursor.fetchall()]
-
-            schema_parts = []
-            for table in tables:
-                cursor.execute(f"DESCRIBE `{table}`")
-                columns = cursor.fetchall()
-                col_defs = [f"  {col[0]} {col[1]}" for col in columns]
-                schema_parts.append(f"Table: {table}\n" + "\n".join(col_defs))
-
-            conn.close()
-            return "\n\n".join(schema_parts)
-        except Exception as e:
-            logger.error("schema_fetch_failed", error=str(e))
-            return f"Error fetching schema: {str(e)}"
-
-    @app.post("/api/vanna/v2/chat_sse", tags=["Chat"])
-    async def chat_sse(request: Request):
-        body = await request.json()
-        message = (body.get("message") or "").strip()
-        conversation_id = (
-            request.headers.get("X-Conversation-Id")
-            or request.cookies.get("vanna_conversation_id")
-            or body.get("conversation_id")
-            or f"conv_{uuid.uuid4().hex[:8]}"
-        )
-        request_id = str(uuid.uuid4())
-
-        async def event_stream():
-            try:
-                yield _sse_event(
-                    {
-                        "rich": _rich_base(
-                            event_id="vanna-status-bar",
-                            event_type="status_bar_update",
-                            data={
-                                "status": "working",
-                                "message": "Processing your request...",
-                                "detail": "Analyzing query",
-                            },
-                        ),
-                        "simple": None,
-                        "conversation_id": conversation_id,
-                        "request_id": request_id,
-                        "timestamp": time.time(),
-                    }
-                )
-
-                task_id = str(uuid.uuid4())
-                yield _sse_event(
-                    {
-                        "rich": _rich_base(
-                            event_id="vanna-task-tracker",
-                            event_type="task_tracker_update",
-                            data={
-                                "operation": "add_task",
-                                "task": {
-                                    "id": task_id,
-                                    "title": "Generate SQL",
-                                    "description": "Generating a SQL query for your question",
-                                    "status": "pending",
-                                    "progress": None,
-                                    "created_at": _now_iso(),
-                                    "completed_at": None,
-                                    "metadata": {},
-                                },
-                                "task_id": None,
-                                "status": None,
-                                "progress": None,
-                                "detail": None,
-                            },
-                        ),
-                        "simple": None,
-                        "conversation_id": conversation_id,
-                        "request_id": request_id,
-                        "timestamp": time.time(),
-                    }
-                )
-
-                schema = _get_database_schema()
-                system_prompt = (
-                    "You are a helpful SQL assistant. You help users query a MySQL database.\n\n"
-                    f"The current database name is: {mysql_database}\n\n"
-                    f"Here is the database schema:\n{schema}\n\n"
-                    "When the user asks a question:\n"
-                    "1. Understand what data they need\n"
-                    "2. Generate a valid MySQL query to get that data\n"
-                    "3. Always wrap your SQL in ```sql and ``` code blocks\n"
-                    "4. Explain what the query does\n\n"
-                    "Important:\n"
-                    "- Do NOT use placeholders like 'your_database_name'.\n"
-                    "- Use the current database implicitly (e.g. use `SHOW TABLES;` instead of `SHOW TABLES IN ...`).\n\n"
-                    "Be concise and helpful."
-                )
-
-                response = client.chat.completions.create(
-                    model=openai_model,
-                    messages=[
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": message},
-                    ],
-                    temperature=0.1,
-                )
-                ai_response = response.choices[0].message.content
-
-                yield _sse_event(
-                    {
-                        "rich": _rich_base(
-                            event_id="vanna-task-tracker",
-                            event_type="task_tracker_update",
-                            data={
-                                "operation": "update_task",
-                                "task": None,
-                                "task_id": task_id,
-                                "status": "completed",
-                                "progress": None,
-                                "detail": None,
-                            },
-                        ),
-                        "simple": None,
-                        "conversation_id": conversation_id,
-                        "request_id": request_id,
-                        "timestamp": time.time(),
-                    }
-                )
-
-                # Extract SQL and execute it (best-effort), similar to /api/chat
-                sql_query = None
-                sql_error = None
-                data = None
-                if isinstance(ai_response, str) and "```sql" in ai_response:
-                    import re
-
-                    sql_match = re.search(r"```sql\s*(.*?)\s*```", ai_response, re.DOTALL)
-                    if sql_match:
-                        sql_query = normalize_generated_sql(sql_match.group(1).strip())
-                        if sql_query:
-                            data, sql_error = _execute_sql(sql_query)
-
-                final_text = ai_response or ""
-                if sql_error:
-                    final_text = (final_text + f"\n\n**SQL Execution Error:** {sql_error}").strip()
-                else:
-                    row_count = len(data or [])
-                    if sql_query and row_count == 0:
-                        final_text = "No results were found for your question."
-                    elif sql_query and row_count > 0:
-                        max_rows = 25
-                        preview_rows = (data or [])[:max_rows]
-                        summary_prompt = (
-                            "You are a helpful data analyst. Answer the user's question using ONLY the SQL results provided. "
-                            "Do not include SQL in your answer. If the results don't contain enough information, say so. "
-                            "Be concise.\n\n"
-                            f"User question: {message}\n"
-                            f"Row count: {row_count}\n"
-                            f"Rows (up to {max_rows}): {json.dumps(preview_rows, ensure_ascii=False, cls=DatabaseJSONEncoder)}\n"
-                        )
-
-                        try:
-                            summary = client.chat.completions.create(
-                                model=openai_model,
-                                messages=[
-                                    {"role": "system", "content": "Answer using the provided rows."},
-                                    {"role": "user", "content": summary_prompt},
-                                ],
-                                temperature=0.1,
-                            )
-                            summarized_text = summary.choices[0].message.content
-                            if summarized_text and summarized_text.strip():
-                                final_text = summarized_text.strip()
-                            else:
-                                final_text = f"Query returned {row_count} rows."
-                        except Exception as e:
-                            logger.error("chat_sse_result_summarize_failed", error=str(e))
-                            final_text = f"Query returned {row_count} rows."
-
-                yield _sse_event(
-                    {
-                        "rich": _rich_base(
-                            event_id="vanna-status-bar",
-                            event_type="status_bar_update",
-                            data={
-                                "status": "idle",
-                                "message": "Response complete",
-                                "detail": "Ready for next message",
-                            },
-                        ),
-                        "simple": None,
-                        "conversation_id": conversation_id,
-                        "request_id": request_id,
-                        "timestamp": time.time(),
-                    }
-                )
-
-                yield _sse_event(
-                    {
-                        "rich": _rich_base(
-                            event_id="vanna-chat-input",
-                            event_type="chat_input_update",
-                            data={"placeholder": "Ask a follow-up question...", "disabled": False, "value": None, "focus": None},
-                        ),
-                        "simple": None,
-                        "conversation_id": conversation_id,
-                        "request_id": request_id,
-                        "timestamp": time.time(),
-                    }
-                )
-
-                yield _sse_event(
-                    {
-                        "rich": _rich_base(
-                            event_id=str(uuid.uuid4()),
-                            event_type="text",
-                            data={"content": final_text, "markdown": True, "code_language": None, "font_size": None, "font_weight": None, "text_align": None},
-                        ),
-                        "simple": _simple_text(final_text),
-                        "conversation_id": conversation_id,
-                        "request_id": request_id,
-                        "timestamp": time.time(),
-                    }
-                )
-
-                yield "data: [DONE]\n\n"
-            except Exception as e:
-                err_text = f"SSE handler failed: {e}"
-                logger.error("chat_sse_failed", error=str(e))
-                yield _sse_event(
-                    {
-                        "rich": _rich_base(
-                            event_id=str(uuid.uuid4()),
-                            event_type="text",
-                            data={"content": err_text, "markdown": True, "code_language": None, "font_size": None, "font_weight": None, "text_align": None},
-                        ),
-                        "simple": _simple_text(err_text),
-                        "conversation_id": conversation_id,
-                        "request_id": request_id,
-                        "timestamp": time.time(),
-                    }
-                )
-                yield "data: [DONE]\n\n"
-
-        return StreamingResponse(event_stream(), media_type="text/event-stream")
+    """
+    This function previously overrode VannaFastAPIServer's /api/vanna/v2/chat_sse endpoint.
+    Now it does nothing, allowing VannaFastAPIServer to handle the SSE endpoint
+    using the proper Agent -> Tool Registry -> RunSQLTool/SafeRunSQLTool + Agent Memory architecture.
+    
+    The VannaFastAPIServer provides a proper SSE endpoint that uses the agent architecture.
+    """
+    logger.info("VannaFastAPIServer will handle /api/vanna/v2/chat_sse endpoint with agent architecture")
+    
+    # Note: We're NOT removing VannaFastAPIServer's route anymore
+    # The VannaFastAPIServer's endpoint will be used, which follows the proper architecture:
+    # Agent -> Tool Registry -> RunSQLTool/SafeRunSQLTool + Agent Memory (Chroma)
 
 
 # -----------------------------------------------------------------------------
