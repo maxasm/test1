@@ -13,11 +13,37 @@ import time
 import hmac
 import hashlib
 import re
-from datetime import datetime
+from datetime import datetime, date
+from decimal import Decimal
 from typing import Optional, Dict, List, Set
 
 from dotenv import load_dotenv
 import structlog
+
+
+# -----------------------------------------------------------------------------
+# Custom JSON Encoder for Database Types
+# -----------------------------------------------------------------------------
+class DatabaseJSONEncoder(json.JSONEncoder):
+    """
+    Custom JSON encoder that handles database-specific types:
+    - Decimal -> float
+    - datetime -> ISO format string
+    - date -> ISO format string
+    """
+    
+    def default(self, obj):
+        if isinstance(obj, Decimal):
+            # Convert Decimal to float for JSON serialization
+            return float(obj)
+        elif isinstance(obj, datetime):
+            # Convert datetime to ISO format string
+            return obj.isoformat()
+        elif isinstance(obj, date):
+            # Convert date to ISO format string
+            return obj.isoformat()
+        # Let the base class default method raise the TypeError
+        return super().default(obj)
 
 load_dotenv()
 
@@ -420,9 +446,10 @@ def _csv_to_set(value: Optional[str]) -> Set[str]:
 # -----------------------------------------------------------------------------
 class SafeRunSqlTool(RunSqlTool):
     """
-    Defense-in-depth. Combineer dit met:
-    - DB user die enkel SELECT heeft op de AI views
-    - Views die alleen toegelaten kolommen bevatten
+    Safe SQL tool wrapper with security features.
+    Combine with:
+    - DB user with SELECT-only permissions on appropriate views/tables
+    - Views that expose only allowed columns
     """
 
     DEFAULT_LIMIT = int(os.getenv("AI_DEFAULT_LIMIT", "200"))
@@ -431,6 +458,9 @@ class SafeRunSqlTool(RunSqlTool):
     # Optional deny lists from env
     BLOCKED_RELATIONS = _csv_to_set(os.getenv("AI_BLOCKED_RELATIONS"))
     BLOCKED_COLS = _csv_to_set(os.getenv("AI_BLOCKED_COLS"))
+    
+    # Allowed tables/views (can be configured via environment)
+    ALLOWED_TABLES = _csv_to_set(os.getenv("AI_ALLOWED_TABLES", ""))
 
     def run(self, sql: str, user=None):
         logger.warning("SAFE run() HIT user=%r sql=%r", getattr(user, "id", None), (sql or "")[:200])
@@ -446,9 +476,16 @@ class SafeRunSqlTool(RunSqlTool):
         if not (s_low.startswith("select") or s_low.startswith("with")):
             raise ValueError("Only SELECT/WITH queries are allowed.")
 
-        # enforce only our AI view (strongly recommended)
-        if "vw_aankoopbonlijnen_ai" not in s_low:
-            raise ValueError("Query must use vw_aankoopbonlijnen_ai.")
+        # Check for allowed tables if configured
+        if self.ALLOWED_TABLES:
+            table_found = False
+            for table in self.ALLOWED_TABLES:
+                if re.search(rf"\b{re.escape(table)}\b", s_low):
+                    table_found = True
+                    break
+            if not table_found:
+                allowed_list = ", ".join(sorted(self.ALLOWED_TABLES))
+                raise ValueError(f"Query must use one of the allowed tables/views: {allowed_list}")
 
         # no SELECT *
         if re.search(r"\bselect\s+\*\b", s_low):
@@ -480,36 +517,39 @@ class SafeRunSqlTool(RunSqlTool):
 # Memory seeding
 # -----------------------------------------------------------------------------
 SCHEMA_DOC = """
-Database context (MySQL) - AI query scope:
+Database Query Guidelines (MySQL):
 
-Toegestane bron (enige bron):
-- vw_aankoopbonlijnen_ai
+General Principles:
+- Connect to the actual MySQL database to discover available tables and columns
+- Use appropriate tables and columns based on the actual database schema
+- Always verify table and column names exist before using them in queries
 
-Kolommen (belangrijkste):
-- datum_bestelling (DATE): bestel-/boekingdatum (primaire tijdfilter)
-- l_naam (VARCHAR): leveranciernaam (primaire leverancierfilter)
-- l_nr (INT): leveranciersnummer
-- artikelcode, productcode
-- omschrijving (TEXT)
-- merk, groep, subgroep
-- hoev, prijs, tot_prijs
-- klantnaam, project, project_omschrijving, bestemming
+Query Rules:
+- Only use SELECT or WITH queries (no data modification)
+- Never use SELECT *; always specify explicit column names
+- Always add a LIMIT clause (default 200 rows unless otherwise specified)
+- Use appropriate table and column names based on the actual database schema
+- For text filters: use robust UPPER(TRIM(col)) LIKE '%TERM%' pattern matching
+- Date/time filters should use appropriate database functions
 
-Business regels:
-- Leveranciernaam staat in l_naam (l_nr is nummer).
-- ref_leverancier is NIET de primaire leverancierfilter.
-- 'Thermokey' kan voorkomen in l_naam, merk of omschrijving.
-- Tekstfilters: UPPER(TRIM(col)) LIKE '%TERM%'.
-- De view is lijnniveau: elke rij = 1 aankoopbonlijn (item). Eén aankoopbon heeft meerdere lijnen.
-- Als de gebruiker "bonnen/aankoopbonnen" vraagt: geef bonniveau (GROUP BY aankoopbon).
-- Als de gebruiker "lijnen/items/artikelen" vraagt: geef lijnniveau (WHERE aankoopbon = ...).
-- Voor aantal bonnen: COUNT(DISTINCT aankoopbon). Voor bon totaal: SUM(tot_prijs) GROUP BY aankoopbon.
+Best Practices:
+- Understand the database schema before generating queries
+- Use appropriate joins based on foreign key relationships
+- Aggregate functions (SUM, COUNT, AVG) should be used with GROUP BY when needed
+- Always consider performance implications of queries
+- Use parameterized queries or proper escaping to prevent SQL injection
 
-Query regels:
-- Alleen SELECT/WITH, geen SELECT *, altijd LIMIT.
-- Gebruik duidelijke aliases.
-- Datums zijn DATE (YYYY-MM-DD).
-- Default periode: laatste 90 dagen als geen periode gegeven.
+Output Format:
+- Provide clear column aliases for better readability
+- Format dates consistently (YYYY-MM-DD)
+- Include appropriate WHERE clauses to filter data meaningfully
+- Structure results in a logical, readable format
+
+Important:
+- Data always comes from the connected MySQL database
+- The system should dynamically discover available tables and columns
+- Use English table and column names in queries
+- Follow standard SQL conventions for the specific database
 """.strip()
 
 
@@ -535,59 +575,71 @@ def seed_memory(agent_memory, text: str, meta: dict) -> bool:
 GOLDEN_QUERIES = [
     (
         """
-BONNIVEAU - laatste bonnen:
-SELECT
-  aankoopbon,
-  MAX(datum_bestelling) AS datum_bestelling,
-  MAX(l_naam) AS leverancier,
-  COUNT(*) AS aantal_lijnen,
-  ROUND(SUM(tot_prijs), 2) AS bon_totaal
-FROM vw_aankoopbonlijnen_ai
-GROUP BY aankoopbon
-ORDER BY datum_bestelling DESC
+Example: Get recent records from a table
+SELECT 
+    id,
+    created_at,
+    name,
+    status,
+    amount
+FROM your_table_name
+WHERE created_at >= DATE_SUB(CURDATE(), INTERVAL 30 DAY)
+ORDER BY created_at DESC
 LIMIT 50;
 """.strip(),
-        {"type": "example_query", "topic": "bonniveau_recent"},
+        {"type": "example_query", "topic": "recent_records"},
     ),
     (
         """
-LIJNNIVEAU - details van één bon (vervang 123456 door het gewenste bonnummer):
-SELECT
-  aankoopbon, datum_bestelling, l_naam, artikelcode, omschrijving, hoev, prijs, tot_prijs
-FROM vw_aankoopbonlijnen_ai
-WHERE aankoopbon = 123456
+Example: Get details for a specific record
+SELECT 
+    id,
+    name,
+    description,
+    quantity,
+    price,
+    total_amount
+FROM your_table_name
+WHERE id = 123456
 ORDER BY id ASC
 LIMIT 200;
 """.strip(),
-        {"type": "example_query", "topic": "bon_detail"},
+        {"type": "example_query", "topic": "record_detail"},
     ),
     (
         """
-THERMOKEY - laatste 90 dagen:
-SELECT datum_bestelling, l_naam, merk, artikelcode, LEFT(omschrijving, 120) AS omschrijving, tot_prijs
-FROM vw_aankoopbonlijnen_ai
-WHERE datum_bestelling >= DATE_SUB(CURDATE(), INTERVAL 90 DAY)
-  AND (
-    UPPER(TRIM(l_naam)) LIKE '%THERMOKEY%'
-    OR UPPER(TRIM(merk)) LIKE '%THERMOKEY%'
-    OR UPPER(TRIM(omschrijving)) LIKE '%THERMOKEY%'
-  )
-ORDER BY datum_bestelling DESC
+Example: Search for records by keyword
+SELECT 
+    id,
+    name,
+    category,
+    description,
+    created_at
+FROM your_table_name
+WHERE 
+    UPPER(TRIM(name)) LIKE '%SEARCH_TERM%'
+    OR UPPER(TRIM(description)) LIKE '%SEARCH_TERM%'
+    OR UPPER(TRIM(category)) LIKE '%SEARCH_TERM%'
+ORDER BY created_at DESC
 LIMIT 200;
 """.strip(),
-        {"type": "example_query", "topic": "thermokey"},
+        {"type": "example_query", "topic": "keyword_search"},
     ),
     (
         """
-TOP leveranciers op spend (12m):
-SELECT l_naam, COUNT(DISTINCT aankoopbon) AS aantal_bonnen, ROUND(SUM(tot_prijs),2) AS totaal
-FROM vw_aankoopbonlijnen_ai
-WHERE datum_bestelling >= DATE_SUB(CURDATE(), INTERVAL 12 MONTH)
-GROUP BY l_naam
-ORDER BY totaal DESC
+Example: Aggregate data by category
+SELECT 
+    category,
+    COUNT(*) AS record_count,
+    ROUND(SUM(amount), 2) AS total_amount,
+    ROUND(AVG(amount), 2) AS average_amount
+FROM your_table_name
+WHERE created_at >= DATE_SUB(CURDATE(), INTERVAL 12 MONTH)
+GROUP BY category
+ORDER BY total_amount DESC
 LIMIT 50;
 """.strip(),
-        {"type": "example_query", "topic": "top_suppliers"},
+        {"type": "example_query", "topic": "aggregate_by_category"},
     ),
 ]
 
@@ -765,13 +817,13 @@ def create_vanna_agent() -> Agent:
             seed_memory(
                 agent_memory,
                 SCHEMA_DOC,
-                {"type": "db_schema", "scope": "vw_aankoopbonlijnen_ai", "version": seed_version},
+                {"type": "db_schema", "scope": "general_database", "version": seed_version},
             )
             for text, meta in GOLDEN_QUERIES:
                 seed_memory(
                     agent_memory,
                     text.strip(),
-                    {"scope": "vw_aankoopbonlijnen_ai", "version": seed_version, **meta},
+                    {"scope": "example_queries", "version": seed_version, **meta},
                 )
             try:
                 os.makedirs(persist_dir, exist_ok=True)
@@ -783,7 +835,40 @@ def create_vanna_agent() -> Agent:
         else:
             logger.info("memory_already_seeded", version=seed_version)
     
-    # 7. Create the Vanna Agent
+    # 7. Configure Agent with tool usage reinforcement
+    logger.info("configuring_agent_with_tool_prompt")
+    
+    # Agent config: reinforce tool usage and output-first behavior
+    cfg = AgentConfig()
+    force_txt = """
+You have a SQL tool named run_sql that executes real MySQL SELECT/WITH queries.
+Use appropriate tables and views based on the database schema.
+
+WORKFLOW (output-first):
+1) If the question is database-related, immediately execute a first SELECT via run_sql.
+2) If the user doesn't specify a time period: use appropriate default filters based on the context.
+3) Always show results (even if 0 rows: say it's 0 and give 1 suggestion to refine).
+4) Ask at most 1 clarification question, and only if it's truly ambiguous.
+
+SQL RULES:
+- Only SELECT or WITH (no mutations).
+- Never SELECT *; choose explicit columns.
+- Always add a LIMIT (max 200 unless requested).
+- For text filters: use robust UPPER(TRIM(col)) LIKE '%TERM%'.
+- Use appropriate table/column names based on the database schema.
+
+OUTPUT:
+- Give a brief explanation + table result.
+""".strip()
+
+    for attr in ("system_prompt", "instructions", "prompt", "agent_instructions"):
+        if hasattr(cfg, attr):
+            try:
+                setattr(cfg, attr, force_txt)
+            except Exception:
+                pass
+    
+    # 8. Create the Vanna Agent
     logger.info("creating_agent")
     
     agent = Agent(
@@ -791,6 +876,7 @@ def create_vanna_agent() -> Agent:
         tool_registry=tools,
         user_resolver=user_resolver,
         agent_memory=agent_memory,
+        config=cfg,
     )
     
     logger.info("agent_created_successfully")
@@ -1129,7 +1215,7 @@ Be concise and helpful."""
                                     "Be concise.\n\n"
                                     f"User question: {chat_request.message}\n"
                                     f"Row count: {row_count}\n"
-                                    f"Rows (up to {max_rows}): {json.dumps(preview_rows, ensure_ascii=False)}\n"
+                                    f"Rows (up to {max_rows}): {json.dumps(preview_rows, ensure_ascii=False, cls=DatabaseJSONEncoder)}\n"
                                 )
 
                                 try:
@@ -1583,7 +1669,7 @@ def add_chat_sse_endpoint(app):
                             "Be concise.\n\n"
                             f"User question: {message}\n"
                             f"Row count: {row_count}\n"
-                            f"Rows (up to {max_rows}): {json.dumps(preview_rows, ensure_ascii=False)}\n"
+                            f"Rows (up to {max_rows}): {json.dumps(preview_rows, ensure_ascii=False, cls=DatabaseJSONEncoder)}\n"
                         )
 
                         try:
@@ -1877,12 +1963,9 @@ def add_debug_endpoints(app, agent: Agent):
         if not sql_tool:
             raise HTTPException(status_code=500, detail="No RunSqlTool found")
         
-        # Test SQL
+        # Test SQL - use a simple generic query
         sql = """
-        SELECT datum_bestelling, l_naam, artikelcode, omschrijving, hoev, tot_prijs
-        FROM vw_aankoopbonlijnen_ai
-        ORDER BY datum_bestelling DESC
-        LIMIT 3
+        SELECT 1 as test_value, 'test' as test_string, NOW() as current_time
         """
         
         try:

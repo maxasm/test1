@@ -151,9 +151,10 @@ class SignedHeaderUserResolver(UserResolver):
 # ------------------------------------------------------------
 class SafeRunSqlTool(RunSqlTool):
     """
-    Defense-in-depth. Combineer dit met:
-    - DB user die enkel SELECT heeft op de AI views
-    - Views die alleen toegelaten kolommen bevatten
+    Safe SQL tool wrapper with security features.
+    Combine with:
+    - DB user with SELECT-only permissions on appropriate views/tables
+    - Views that expose only allowed columns
     """
 
     DEFAULT_LIMIT = int(os.getenv("AI_DEFAULT_LIMIT", "200"))
@@ -162,6 +163,9 @@ class SafeRunSqlTool(RunSqlTool):
     # Optional deny lists from env
     BLOCKED_RELATIONS = _csv_to_set(os.getenv("AI_BLOCKED_RELATIONS"))
     BLOCKED_COLS = _csv_to_set(os.getenv("AI_BLOCKED_COLS"))
+    
+    # Allowed tables/views (can be configured via environment)
+    ALLOWED_TABLES = _csv_to_set(os.getenv("AI_ALLOWED_TABLES", ""))
 
     def run(self, sql: str, user=None):
         logger.warning("SAFE run() HIT user=%r sql=%r", getattr(user, "id", None), (sql or "")[:200])
@@ -177,9 +181,16 @@ class SafeRunSqlTool(RunSqlTool):
         if not (s_low.startswith("select") or s_low.startswith("with")):
             raise ValueError("Only SELECT/WITH queries are allowed.")
 
-        # enforce only our AI view (strongly recommended)
-        if "vw_aankoopbonlijnen_ai" not in s_low:
-            raise ValueError("Query must use vw_aankoopbonlijnen_ai.")
+        # Check for allowed tables if configured
+        if self.ALLOWED_TABLES:
+            table_found = False
+            for table in self.ALLOWED_TABLES:
+                if re.search(rf"\b{re.escape(table)}\b", s_low):
+                    table_found = True
+                    break
+            if not table_found:
+                allowed_list = ", ".join(sorted(self.ALLOWED_TABLES))
+                raise ValueError(f"Query must use one of the allowed tables/views: {allowed_list}")
 
         # no SELECT *
         if re.search(r"\bselect\s+\*\b", s_low):
@@ -213,34 +224,26 @@ class SafeRunSqlTool(RunSqlTool):
 SCHEMA_DOC = """
 Database context (MySQL) - AI query scope:
 
-Toegestane bron (enige bron):
-- vw_aankoopbonlijnen_ai
+General database querying guidelines:
 
-Kolommen (belangrijkste):
-- datum_bestelling (DATE): bestel-/boekingdatum (primaire tijdfilter)
-- l_naam (VARCHAR): leveranciernaam (primaire leverancierfilter)
-- l_nr (INT): leveranciersnummer
-- artikelcode, productcode
-- omschrijving (TEXT)
-- merk, groep, subgroep
-- hoev, prijs, tot_prijs
-- klantnaam, project, project_omschrijving, bestemming
+Query rules:
+- Only SELECT or WITH queries (no mutations).
+- Never use SELECT *; always specify explicit columns.
+- Always add a LIMIT clause (default 200 rows unless otherwise specified).
+- Use appropriate table and column names based on the actual database schema.
+- For text filters: use robust UPPER(TRIM(col)) LIKE '%TERM%' pattern matching.
+- Date/time filters should use appropriate database functions.
 
-Business regels:
-- Leveranciernaam staat in l_naam (l_nr is nummer).
-- ref_leverancier is NIET de primaire leverancierfilter.
-- 'Thermokey' kan voorkomen in l_naam, merk of omschrijving.
-- Tekstfilters: UPPER(TRIM(col)) LIKE '%TERM%'.
-- De view is lijnniveau: elke rij = 1 aankoopbonlijn (item). Eén aankoopbon heeft meerdere lijnen.
-- Als de gebruiker "bonnen/aankoopbonnen" vraagt: geef bonniveau (GROUP BY aankoopbon).
-- Als de gebruiker "lijnen/items/artikelen" vraagt: geef lijnniveau (WHERE aankoopbon = ...).
-- Voor aantal bonnen: COUNT(DISTINCT aankoopbon). Voor bon totaal: SUM(tot_prijs) GROUP BY aankoopbon.
+Best practices:
+- Understand the database schema before generating queries.
+- Use appropriate joins based on foreign key relationships.
+- Aggregate functions (SUM, COUNT, AVG) should be used with GROUP BY when needed.
+- Always consider performance implications of queries.
 
-Query regels:
-- Alleen SELECT/WITH, geen SELECT *, altijd LIMIT.
-- Gebruik duidelijke aliases.
-- Datums zijn DATE (YYYY-MM-DD).
-- Default periode: laatste 90 dagen als geen periode gegeven.
+Output format:
+- Provide clear column aliases for better readability.
+- Format dates consistently (YYYY-MM-DD).
+- Include appropriate WHERE clauses to filter data meaningfully.
 """.strip()
 
 
@@ -266,59 +269,80 @@ def seed_memory(agent_memory, text: str, meta: dict) -> bool:
 GOLDEN_QUERIES = [
     (
         """
-BONNIVEAU - laatste bonnen:
-SELECT
-  aankoopbon,
-  MAX(datum_bestelling) AS datum_bestelling,
-  MAX(l_naam) AS leverancier,
-  COUNT(*) AS aantal_lijnen,
-  ROUND(SUM(tot_prijs), 2) AS bon_totaal
-FROM vw_aankoopbonlijnen_ai
-GROUP BY aankoopbon
-ORDER BY datum_bestelling DESC
+Example: Get recent orders with customer information
+SELECT 
+    o.order_id,
+    o.order_date,
+    c.customer_name,
+    c.email,
+    o.total_amount,
+    o.status
+FROM orders o
+JOIN customers c ON o.customer_id = c.customer_id
+WHERE o.order_date >= DATE_SUB(CURDATE(), INTERVAL 30 DAY)
+ORDER BY o.order_date DESC
 LIMIT 50;
 """.strip(),
-        {"type": "example_query", "topic": "bonniveau_recent"},
+        {"type": "example_query", "topic": "recent_orders"},
     ),
     (
         """
-LIJNNIVEAU - details van één bon (vervang 123456 door het gewenste bonnummer):
-SELECT
-  aankoopbon, datum_bestelling, l_naam, artikelcode, omschrijving, hoev, prijs, tot_prijs
-FROM vw_aankoopbonlijnen_ai
-WHERE aankoopbon = 123456
-ORDER BY id ASC
+Example: Get order details for a specific order
+SELECT 
+    o.order_id,
+    o.order_date,
+    p.product_name,
+    p.category,
+    oi.quantity,
+    oi.unit_price,
+    oi.line_total
+FROM orders o
+JOIN order_items oi ON o.order_id = oi.order_id
+JOIN products p ON oi.product_id = p.product_id
+WHERE o.order_id = 123456
+ORDER BY oi.item_id ASC
 LIMIT 200;
 """.strip(),
-        {"type": "example_query", "topic": "bon_detail"},
+        {"type": "example_query", "topic": "order_detail"},
     ),
     (
         """
-THERMOKEY - laatste 90 dagen:
-SELECT datum_bestelling, l_naam, merk, artikelcode, LEFT(omschrijving, 120) AS omschrijving, tot_prijs
-FROM vw_aankoopbonlijnen_ai
-WHERE datum_bestelling >= DATE_SUB(CURDATE(), INTERVAL 90 DAY)
-  AND (
-    UPPER(TRIM(l_naam)) LIKE '%THERMOKEY%'
-    OR UPPER(TRIM(merk)) LIKE '%THERMOKEY%'
-    OR UPPER(TRIM(omschrijving)) LIKE '%THERMOKEY%'
-  )
-ORDER BY datum_bestelling DESC
-LIMIT 200;
+Example: Search for products by keyword
+SELECT 
+    p.product_id,
+    p.product_name,
+    p.category,
+    p.price,
+    p.description,
+    p.in_stock
+FROM products p
+WHERE 
+    p.product_name LIKE '%search_term%'
+    OR p.description LIKE '%search_term%'
+    OR p.category LIKE '%search_term%'
+ORDER BY p.product_name
+LIMIT 100;
 """.strip(),
-        {"type": "example_query", "topic": "thermokey"},
+        {"type": "example_query", "topic": "product_search"},
     ),
     (
         """
-TOP leveranciers op spend (12m):
-SELECT l_naam, COUNT(DISTINCT aankoopbon) AS aantal_bonnen, ROUND(SUM(tot_prijs),2) AS totaal
-FROM vw_aankoopbonlijnen_ai
-WHERE datum_bestelling >= DATE_SUB(CURDATE(), INTERVAL 12 MONTH)
-GROUP BY l_naam
-ORDER BY totaal DESC
+Example: Top customers by total spending (last 12 months)
+SELECT 
+    c.customer_id,
+    c.customer_name,
+    c.email,
+    COUNT(DISTINCT o.order_id) AS order_count,
+    ROUND(SUM(o.total_amount), 2) AS total_spent
+FROM customers c
+JOIN orders o ON c.customer_id = o.customer_id
+WHERE o.order_date >= DATE_SUB(CURDATE(), INTERVAL 12 MONTH)
+    AND o.status = 'completed'
+GROUP BY c.customer_id, c.customer_name, c.email
+ORDER BY total_spent DESC
 LIMIT 50;
 """.strip(),
-        {"type": "example_query", "topic": "top_suppliers"},
+        {"type": "example_query", "topic": "top_customers"},
     ),
 ]
 
@@ -352,13 +376,13 @@ def build_app() -> FastAPI:
         seed_memory(
             memory,
             SCHEMA_DOC,
-            {"type": "db_schema", "scope": "vw_aankoopbonlijnen_ai", "version": seed_version},
+            {"type": "db_schema", "scope": "general_database", "version": seed_version},
         )
         for text, meta in GOLDEN_QUERIES:
             seed_memory(
                 memory,
                 text.strip(),
-                {"scope": "vw_aankoopbonlijnen_ai", "version": seed_version, **meta},
+                {"scope": "example_queries", "version": seed_version, **meta},
             )
         try:
             os.makedirs(persist_dir, exist_ok=True)
@@ -391,31 +415,24 @@ def build_app() -> FastAPI:
     # Agent config: reinforce tool usage and output-first behavior
     cfg = AgentConfig()
     force_txt = """
-Je hebt een SQL tool genaamd run_sql die echte MySQL SELECT/WITH queries uitvoert.
-Gebruik uitsluitend de view `vw_aankoopbonlijnen_ai` (nooit raw tables).
+You have a SQL tool named run_sql that executes real MySQL SELECT/WITH queries.
+Use appropriate tables and views based on the database schema.
 
-WERKWIJZE (output-first):
-1) Als de vraag database-gerelateerd is, voer onmiddellijk een eerste SELECT uit via run_sql.
-2) Als de gebruiker geen periode geeft: gebruik standaard de laatste 90 dagen op datum_bestelling.
-3) Toon altijd resultaten (ook als 0 rijen: zeg dat het 0 is en geef 1 suggestie om te verfijnen).
-4) Stel maximaal 1 verduidelijkingsvraag, en alleen als het echt niet eenduidig is.
+WORKFLOW (output-first):
+1) If the question is database-related, immediately execute a first SELECT via run_sql.
+2) If the user doesn't specify a time period: use appropriate default filters based on the context.
+3) Always show results (even if 0 rows: say it's 0 and give 1 suggestion to refine).
+4) Ask at most 1 clarification question, and only if it's truly ambiguous.
 
-SQL REGELS:
-- Alleen SELECT of WITH (geen mutaties).
-- Nooit SELECT *; kies expliciete kolommen.
-- Voeg altijd een LIMIT toe (max 200 tenzij gevraagd).
-- Bij tekstfilters: gebruik robuust UPPER(TRIM(col)) LIKE '%TERM%'.
-- Leverancierfilter: gebruik `l_naam` (niet ref_leverancier).
-- 'Thermokey' kan voorkomen in l_naam, merk of omschrijving; controleer in die volgorde.
-
-BONNIVEAU vs LIJNNIVEAU:
-- vw_aankoopbonlijnen_ai is lijnniveau (1 rij = 1 bonlijn/item). Eén aankoopbon heeft meerdere lijnen.
-- Als gebruiker "bonnen/aankoopbonnen" vraagt: toon bonniveau (GROUP BY aankoopbon, SUM(tot_prijs)).
-- Als gebruiker "lijnen/items/artikelen" vraagt: toon lijnniveau (WHERE aankoopbon = ...).
-- Voor aantal bonnen: COUNT(DISTINCT aankoopbon).
+SQL RULES:
+- Only SELECT or WITH (no mutations).
+- Never SELECT *; choose explicit columns.
+- Always add a LIMIT (max 200 unless requested).
+- For text filters: use robust UPPER(TRIM(col)) LIKE '%TERM%'.
+- Use appropriate table/column names based on the database schema.
 
 OUTPUT:
-- Geef een korte toelichting + tabelresultaat.
+- Give a brief explanation + table result.
 """.strip()
 
     for attr in ("system_prompt", "instructions", "prompt", "agent_instructions"):
@@ -486,11 +503,9 @@ OUTPUT:
     # Direct SQL tool test (bypasses LLM)
     @app.get("/debug/sql")
     async def debug_sql():
+        # Use a simple test query that should work with most databases
         sql = """
-        SELECT datum_bestelling, l_naam, artikelcode, omschrijving, hoev, tot_prijs
-        FROM vw_aankoopbonlijnen_ai
-        ORDER BY datum_bestelling DESC
-        LIMIT 3
+        SELECT 1 as test_value, 'test' as test_string, NOW() as current_time
         """
         tool = SafeRunSqlTool(sql_runner=sql_runner)
         u = User(id="debug", email="debug@local", group_memberships=["users"])
