@@ -9,8 +9,12 @@ Following official Vanna 2.0 docs: https://vanna.ai/docs
 import os
 import logging
 import json
+import time
+import hmac
+import hashlib
+import re
 from datetime import datetime
-from typing import Optional
+from typing import Optional, Dict, List, Set
 
 from dotenv import load_dotenv
 import structlog
@@ -317,6 +321,277 @@ class PHPFrontendUserResolver(UserResolver):
         )
 
 
+# -----------------------------------------------------------------------------
+# Signed-header resolver (RequestContext-based) - from sample.py
+# -----------------------------------------------------------------------------
+class SignedHeaderUserResolver(UserResolver):
+    """
+    Headers expected (set by PHP proxy or curl):
+      X-User-Email
+      X-User-Id
+      X-User-Groups
+      X-Auth-Ts
+      X-Auth-Nonce
+      X-Auth-Signature  (HMAC-SHA256 over: ts\\nnonce\\nemail\\nuid\\ngroups_raw)
+    """
+
+    def __init__(
+        self,
+        secret: str,
+        max_skew_seconds: int = 300,
+        nonce_ttl_seconds: int = 900,
+        max_nonce_cache: int = 10000,
+    ):
+        self.secret = secret.encode("utf-8") if secret else b""
+        self.max_skew = int(max_skew_seconds)
+        self.nonce_ttl = int(nonce_ttl_seconds)
+        self.max_nonce_cache = int(max_nonce_cache)
+        self._nonces: Dict[str, float] = {}
+
+    def _cleanup_nonces(self) -> None:
+        now = time.time()
+        expired = [k for k, exp in self._nonces.items() if exp <= now]
+        for k in expired:
+            self._nonces.pop(k, None)
+        # Cap cache (drop oldest)
+        if len(self._nonces) > self.max_nonce_cache:
+            for k, _ in sorted(self._nonces.items(), key=lambda kv: kv[1])[
+                : len(self._nonces) - self.max_nonce_cache
+            ]:
+                self._nonces.pop(k, None)
+
+    def _check_replay(self, nonce: str) -> None:
+        self._cleanup_nonces()
+        if nonce in self._nonces:
+            raise ValueError("Replay detected (nonce already used).")
+        self._nonces[nonce] = time.time() + self.nonce_ttl
+
+    async def resolve_user(self, request_context: RequestContext) -> User:
+        if not self.secret:
+            raise ValueError("Missing VANNA_PROXY_HMAC_SECRET (fail closed).")
+
+        email = (request_context.get_header("X-User-Email") or "").strip().lower()
+        uid = (request_context.get_header("X-User-Id") or "").strip()
+        groups_raw = (request_context.get_header("X-User-Groups") or "").strip()
+        ts_s = (request_context.get_header("X-Auth-Ts") or "").strip()
+        nonce = (request_context.get_header("X-Auth-Nonce") or "").strip()
+        sig = (request_context.get_header("X-Auth-Signature") or "").strip()
+
+        if not (email and uid and groups_raw and ts_s and nonce and sig):
+            raise ValueError("Missing signed identity headers.")
+
+        try:
+            ts = int(ts_s)
+        except ValueError:
+            raise ValueError("Invalid X-Auth-Ts.")
+
+        now = int(time.time())
+        skew = abs(now - ts)
+        if skew > self.max_skew:
+            raise ValueError(
+                f"Signature timestamp outside allowed skew "
+                f"(skew={skew}s, max_skew={self.max_skew}s, server_now={now}, ts={ts}, ts_raw={ts_s!r})"
+            )
+
+        self._check_replay(nonce)
+
+        base = f"{ts}\n{nonce}\n{email}\n{uid}\n{groups_raw}"
+        expected = hmac.new(self.secret, base.encode("utf-8"), hashlib.sha256).hexdigest()
+
+        if not hmac.compare_digest(expected, sig):
+            raise ValueError("Invalid signature.")
+
+        groups: List[str] = [g.strip() for g in groups_raw.split(",") if g.strip()] or ["users"]
+        logger.warning("RESOLVER HIT email=%r uid=%r groups=%r", email, uid, groups)
+        return User(id=uid, email=email, group_memberships=groups)
+
+
+# -----------------------------------------------------------------------------
+# Helpers
+# -----------------------------------------------------------------------------
+def _csv_to_set(value: Optional[str]) -> Set[str]:
+    if not value:
+        return set()
+    return {v.strip().lower() for v in value.split(",") if v.strip()}
+
+
+# -----------------------------------------------------------------------------
+# Safe SQL tool wrapper (Vanna 2.x expects RunSqlTool.run)
+# -----------------------------------------------------------------------------
+class SafeRunSqlTool(RunSqlTool):
+    """
+    Defense-in-depth. Combineer dit met:
+    - DB user die enkel SELECT heeft op de AI views
+    - Views die alleen toegelaten kolommen bevatten
+    """
+
+    DEFAULT_LIMIT = int(os.getenv("AI_DEFAULT_LIMIT", "200"))
+    MAX_LIMIT = int(os.getenv("AI_MAX_LIMIT", "500"))
+
+    # Optional deny lists from env
+    BLOCKED_RELATIONS = _csv_to_set(os.getenv("AI_BLOCKED_RELATIONS"))
+    BLOCKED_COLS = _csv_to_set(os.getenv("AI_BLOCKED_COLS"))
+
+    def run(self, sql: str, user=None):
+        logger.warning("SAFE run() HIT user=%r sql=%r", getattr(user, "id", None), (sql or "")[:200])
+
+        s = (sql or "").strip()
+        s_low = s.lower()
+
+        # single statement only
+        if ";" in s_low.rstrip(";"):
+            raise ValueError("Multiple statements are not allowed.")
+
+        # only SELECT/WITH
+        if not (s_low.startswith("select") or s_low.startswith("with")):
+            raise ValueError("Only SELECT/WITH queries are allowed.")
+
+        # enforce only our AI view (strongly recommended)
+        if "vw_aankoopbonlijnen_ai" not in s_low:
+            raise ValueError("Query must use vw_aankoopbonlijnen_ai.")
+
+        # no SELECT *
+        if re.search(r"\bselect\s+\*\b", s_low):
+            raise ValueError("SELECT * is not allowed.")
+
+        # blocked relations (optional)
+        for rel in self.BLOCKED_RELATIONS:
+            if re.search(rf"\b{re.escape(rel)}\b", s_low):
+                raise ValueError(f"Relation '{rel}' is not allowed.")
+
+        # blocked columns (optional)
+        for col in self.BLOCKED_COLS:
+            if re.search(rf"\b{re.escape(col)}\b", s_low):
+                raise ValueError(f"Column '{col}' is not allowed.")
+
+        # enforce LIMIT (and cap)
+        m = re.search(r"\blimit\s+(\d+)\b", s_low)
+        if not m:
+            s = s.rstrip() + f" LIMIT {self.DEFAULT_LIMIT}"
+        else:
+            lim = int(m.group(1))
+            if lim > self.MAX_LIMIT:
+                s = re.sub(r"(?i)\blimit\s+\d+\b", f"LIMIT {self.MAX_LIMIT}", s, count=1)
+
+        return super().run(s, user=user)
+
+
+# -----------------------------------------------------------------------------
+# Memory seeding
+# -----------------------------------------------------------------------------
+SCHEMA_DOC = """
+Database context (MySQL) - AI query scope:
+
+Toegestane bron (enige bron):
+- vw_aankoopbonlijnen_ai
+
+Kolommen (belangrijkste):
+- datum_bestelling (DATE): bestel-/boekingdatum (primaire tijdfilter)
+- l_naam (VARCHAR): leveranciernaam (primaire leverancierfilter)
+- l_nr (INT): leveranciersnummer
+- artikelcode, productcode
+- omschrijving (TEXT)
+- merk, groep, subgroep
+- hoev, prijs, tot_prijs
+- klantnaam, project, project_omschrijving, bestemming
+
+Business regels:
+- Leveranciernaam staat in l_naam (l_nr is nummer).
+- ref_leverancier is NIET de primaire leverancierfilter.
+- 'Thermokey' kan voorkomen in l_naam, merk of omschrijving.
+- Tekstfilters: UPPER(TRIM(col)) LIKE '%TERM%'.
+- De view is lijnniveau: elke rij = 1 aankoopbonlijn (item). Eén aankoopbon heeft meerdere lijnen.
+- Als de gebruiker "bonnen/aankoopbonnen" vraagt: geef bonniveau (GROUP BY aankoopbon).
+- Als de gebruiker "lijnen/items/artikelen" vraagt: geef lijnniveau (WHERE aankoopbon = ...).
+- Voor aantal bonnen: COUNT(DISTINCT aankoopbon). Voor bon totaal: SUM(tot_prijs) GROUP BY aankoopbon.
+
+Query regels:
+- Alleen SELECT/WITH, geen SELECT *, altijd LIMIT.
+- Gebruik duidelijke aliases.
+- Datums zijn DATE (YYYY-MM-DD).
+- Default periode: laatste 90 dagen als geen periode gegeven.
+""".strip()
+
+
+def seed_memory(agent_memory, text: str, meta: dict) -> bool:
+    for fn_name in ("add_text", "add_document", "add_documents", "upsert_text", "upsert"):
+        fn = getattr(agent_memory, fn_name, None)
+        if not fn:
+            continue
+        try:
+            fn(text, metadata=meta)
+            return True
+        except TypeError:
+            try:
+                fn([text], metadatas=[meta])
+                return True
+            except Exception:
+                pass
+        except Exception:
+            pass
+    return False
+
+
+GOLDEN_QUERIES = [
+    (
+        """
+BONNIVEAU - laatste bonnen:
+SELECT
+  aankoopbon,
+  MAX(datum_bestelling) AS datum_bestelling,
+  MAX(l_naam) AS leverancier,
+  COUNT(*) AS aantal_lijnen,
+  ROUND(SUM(tot_prijs), 2) AS bon_totaal
+FROM vw_aankoopbonlijnen_ai
+GROUP BY aankoopbon
+ORDER BY datum_bestelling DESC
+LIMIT 50;
+""".strip(),
+        {"type": "example_query", "topic": "bonniveau_recent"},
+    ),
+    (
+        """
+LIJNNIVEAU - details van één bon (vervang 123456 door het gewenste bonnummer):
+SELECT
+  aankoopbon, datum_bestelling, l_naam, artikelcode, omschrijving, hoev, prijs, tot_prijs
+FROM vw_aankoopbonlijnen_ai
+WHERE aankoopbon = 123456
+ORDER BY id ASC
+LIMIT 200;
+""".strip(),
+        {"type": "example_query", "topic": "bon_detail"},
+    ),
+    (
+        """
+THERMOKEY - laatste 90 dagen:
+SELECT datum_bestelling, l_naam, merk, artikelcode, LEFT(omschrijving, 120) AS omschrijving, tot_prijs
+FROM vw_aankoopbonlijnen_ai
+WHERE datum_bestelling >= DATE_SUB(CURDATE(), INTERVAL 90 DAY)
+  AND (
+    UPPER(TRIM(l_naam)) LIKE '%THERMOKEY%'
+    OR UPPER(TRIM(merk)) LIKE '%THERMOKEY%'
+    OR UPPER(TRIM(omschrijving)) LIKE '%THERMOKEY%'
+  )
+ORDER BY datum_bestelling DESC
+LIMIT 200;
+""".strip(),
+        {"type": "example_query", "topic": "thermokey"},
+    ),
+    (
+        """
+TOP leveranciers op spend (12m):
+SELECT l_naam, COUNT(DISTINCT aankoopbon) AS aantal_bonnen, ROUND(SUM(tot_prijs),2) AS totaal
+FROM vw_aankoopbonlijnen_ai
+WHERE datum_bestelling >= DATE_SUB(CURDATE(), INTERVAL 12 MONTH)
+GROUP BY l_naam
+ORDER BY totaal DESC
+LIMIT 50;
+""".strip(),
+        {"type": "example_query", "topic": "top_suppliers"},
+    ),
+]
+
+
 
 
 
@@ -425,16 +700,34 @@ def create_vanna_agent() -> Agent:
         collection_name=chroma_collection,
     )
     
-    # 4. Configure User Resolver (for PHP frontend integration)
-    user_resolver = PHPFrontendUserResolver()
+    # 4. Configure User Resolver (choose based on environment)
+    use_signed_auth = os.getenv("VANNA_PROXY_HMAC_SECRET", "").strip() != ""
+    if use_signed_auth:
+        logger.info("using_signed_header_auth")
+        user_resolver = SignedHeaderUserResolver(
+            secret=os.getenv("VANNA_PROXY_HMAC_SECRET", ""),
+            max_skew_seconds=int(os.getenv("VANNA_SIG_MAX_SKEW", "3600")),
+            nonce_ttl_seconds=int(os.getenv("VANNA_NONCE_TTL", "900")),
+            max_nonce_cache=int(os.getenv("VANNA_NONCE_CACHE", "10000")),
+        )
+    else:
+        logger.info("using_php_frontend_auth")
+        user_resolver = PHPFrontendUserResolver()
     
     # 5. Register Tools
     logger.info("registering_tools")
     
     tools = ToolRegistry()
     
-    # RunSqlTool - executes SQL queries against MySQL
-    db_tool = RunSqlTool(sql_runner=sql_runner)
+    # Choose between SafeRunSqlTool and regular RunSqlTool based on environment
+    use_safe_sql = os.getenv("AI_ENABLE_SAFE_SQL", "true").lower() == "true"
+    if use_safe_sql:
+        logger.info("using_safe_sql_tool")
+        db_tool = SafeRunSqlTool(sql_runner=sql_runner)
+    else:
+        logger.info("using_regular_sql_tool")
+        db_tool = RunSqlTool(sql_runner=sql_runner)
+    
     tools.register_local_tool(db_tool, access_groups=["admin", "user"])
     
     # VisualizeDataTool - generates charts from query results
@@ -460,7 +753,37 @@ def create_vanna_agent() -> Agent:
         access_groups=["admin", "user"],
     )
     
-    # 6. Create the Vanna Agent
+    # 6. Seed memory with schema and golden queries (if enabled)
+    seed_enabled = os.getenv("CHROMA_SEED_ENABLED", "true").lower() == "true"
+    if seed_enabled:
+        seed_version = int(os.getenv("CHROMA_SEED_VERSION", "1"))
+        persist_dir = os.getenv("CHROMA_PERSIST_DIR", "./chroma_memory")
+        marker_path = os.path.join(persist_dir, f".seeded_v{seed_version}")
+        
+        if not os.path.exists(marker_path):
+            logger.info("seeding_memory", version=seed_version)
+            seed_memory(
+                agent_memory,
+                SCHEMA_DOC,
+                {"type": "db_schema", "scope": "vw_aankoopbonlijnen_ai", "version": seed_version},
+            )
+            for text, meta in GOLDEN_QUERIES:
+                seed_memory(
+                    agent_memory,
+                    text.strip(),
+                    {"scope": "vw_aankoopbonlijnen_ai", "version": seed_version, **meta},
+                )
+            try:
+                os.makedirs(persist_dir, exist_ok=True)
+                with open(marker_path, "w", encoding="utf-8") as f:
+                    f.write(time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime()))
+                logger.info("memory_seeded", marker=marker_path)
+            except Exception as e:
+                logger.error("memory_seed_marker_failed", error=str(e))
+        else:
+            logger.info("memory_already_seeded", version=seed_version)
+    
+    # 7. Create the Vanna Agent
     logger.info("creating_agent")
     
     agent = Agent(
@@ -537,6 +860,9 @@ Pass user identity via headers:
     add_memory_admin_endpoints(app, agent)
     add_chat_endpoint(app, agent)
     add_chat_sse_endpoint(app)
+    
+    # Add debug endpoints
+    add_debug_endpoints(app, agent)
     
     logger.info("server_starting", host=host, port=port)
     
@@ -1468,6 +1794,106 @@ def add_training_endpoints(app, agent: Agent):
             })
         except Exception as e:
             logger.error("training_status_failed", error=str(e))
+            raise HTTPException(status_code=500, detail=str(e))
+
+
+# -----------------------------------------------------------------------------
+# Debug Endpoints
+# -----------------------------------------------------------------------------
+def add_debug_endpoints(app, agent: Agent):
+    """
+    Add debug endpoints for troubleshooting.
+    """
+    from fastapi.responses import JSONResponse
+    from fastapi import HTTPException
+    
+    @app.get("/debug/env")
+    async def debug_env():
+        """
+        Debug endpoint to show environment configuration.
+        """
+        return JSONResponse({
+            "OPENAI_MODEL": os.getenv("OPENAI_MODEL"),
+            "MYSQL_DO_HOST": os.getenv("MYSQL_DO_HOST"),
+            "MYSQL_DO_MAPA_DB": os.getenv("MYSQL_DO_MAPA_DB"),
+            "MYSQL_DO_PORT": os.getenv("MYSQL_DO_PORT"),
+            "VANNA_SIG_MAX_SKEW": os.getenv("VANNA_SIG_MAX_SKEW"),
+            "AI_DEFAULT_LIMIT": os.getenv("AI_DEFAULT_LIMIT"),
+            "AI_MAX_LIMIT": os.getenv("AI_MAX_LIMIT"),
+            "AI_BLOCKED_RELATIONS": os.getenv("AI_BLOCKED_RELATIONS"),
+            "AI_BLOCKED_COLS": os.getenv("AI_BLOCKED_COLS"),
+            "CHROMA_PERSIST_DIR": os.getenv("CHROMA_PERSIST_DIR"),
+            "CHROMA_COLLECTION": os.getenv("CHROMA_COLLECTION"),
+            "CHROMA_SEED_VERSION": os.getenv("CHROMA_SEED_VERSION"),
+        })
+    
+    @app.get("/debug/tools")
+    async def debug_tools():
+        """
+        Debug endpoint to show registered tools.
+        """
+        tools = getattr(agent, "tool_registry", None)
+        if not tools:
+            return JSONResponse({"error": "No tool registry found"})
+        
+        out = {"tool_registry_type": str(type(tools))}
+        for attr in ("_tools", "tools", "_registered_tools", "registered_tools", "local_tools"):
+            if hasattr(tools, attr):
+                try:
+                    v = getattr(tools, attr)
+                    out[attr] = list(v.keys()) if isinstance(v, dict) else [str(x) for x in v]
+                except Exception as e:
+                    out[attr] = f"ERR: {e}"
+        return JSONResponse(out)
+    
+    @app.get("/debug/sql")
+    async def debug_sql():
+        """
+        Debug endpoint to test SQL execution directly.
+        """
+        # Get SQL runner from agent
+        tools = getattr(agent, "tool_registry", None)
+        if not tools:
+            raise HTTPException(status_code=500, detail="No tool registry found")
+        
+        # Find RunSqlTool
+        sql_tool = None
+        for attr in ("_tools", "tools", "_registered_tools", "registered_tools", "local_tools"):
+            if hasattr(tools, attr):
+                v = getattr(tools, attr)
+                if isinstance(v, dict):
+                    for tool_name, tool in v.items():
+                        if "RunSqlTool" in str(type(tool)):
+                            sql_tool = tool
+                            break
+                elif isinstance(v, list):
+                    for tool in v:
+                        if "RunSqlTool" in str(type(tool)):
+                            sql_tool = tool
+                            break
+            if sql_tool:
+                break
+        
+        if not sql_tool:
+            raise HTTPException(status_code=500, detail="No RunSqlTool found")
+        
+        # Test SQL
+        sql = """
+        SELECT datum_bestelling, l_naam, artikelcode, omschrijving, hoev, tot_prijs
+        FROM vw_aankoopbonlijnen_ai
+        ORDER BY datum_bestelling DESC
+        LIMIT 3
+        """
+        
+        try:
+            # Create a debug user
+            from vanna.core.user import User
+            user = User(id="debug", email="debug@local", group_memberships=["users"])
+            
+            # Run SQL
+            rows = sql_tool.run(sql, user=user)
+            return JSONResponse({"rows": rows})
+        except Exception as e:
             raise HTTPException(status_code=500, detail=str(e))
 
 
